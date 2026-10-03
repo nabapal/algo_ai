@@ -1,0 +1,9 @@
+# Local credentials and session tokens
+/settings.json
+/token.json
+
+# Runtime state, logs, and Python cache
+/last_analysis_state.json
+*.log
+__pycache__/
+*.py[cod]
