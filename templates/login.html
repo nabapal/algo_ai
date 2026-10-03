@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · Index Options Engine</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 20px;
+      background: #f2f2f2; color: #101828; font: 15px system-ui, sans-serif; }
+    main { width: min(100%, 390px); padding: 30px; border: 1px solid #e4e7ec; border-radius: 14px;
+      background: white; box-shadow: 0 8px 28px #10182812; }
+    h1 { margin: 0 0 8px; font-size: 22px; }
+    p { margin: 0 0 22px; color: #667085; }
+    label { display: block; margin: 14px 0 6px; font-weight: 600; }
+    input { width: 100%; padding: 11px 12px; border: 1px solid #d0d5dd; border-radius: 8px; font: inherit; }
+    button { width: 100%; margin-top: 20px; padding: 11px; border: 0; border-radius: 8px;
+      background: #2f5fdb; color: white; font: inherit; font-weight: 700; cursor: pointer; }
+    .error { margin: 14px 0 0; padding: 10px; border-radius: 8px; background: #fef3f2; color: #b42318; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Index Options Engine</h1>
+    <p>Sign in to open the private trading dashboard.</p>
+    {% if not login_ready %}<div class="error" role="alert">Server login is not configured. Set APP_USERNAME, an APP_PASSWORD of at least 16 characters, and an APP_SESSION_SECRET of at least 32 characters in the environment or project .env file, then restart the app.</div>{% endif %}
+    <form method="post" action="{{ url_for('login_submit') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="next" value="{{ request.args.get('next', '/') }}">
+      <label for="username">Username</label>
+      <input id="username" name="username" autocomplete="username" required autofocus>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit">Sign in</button>
+      {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
+    </form>
+  </main>
+</body>
+</html>

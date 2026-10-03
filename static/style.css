@@ -87,6 +87,10 @@ h2 {
 }
 
 .topbar-right { display: flex; align-items: center; gap: 12px; }
+.logout-form { margin: 0; }
+.env-credentials { grid-column: 1 / -1; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: #fafafa; }
+.env-credentials span, .env-credentials small { color: var(--text-secondary); }
+.env-credentials small { line-height: 1.5; }
 
 .badge {
   font-size: 11px;

@@ -22,6 +22,7 @@ import time
 import option_signal
 import ai_sentiment
 import decision
+from app_config import load_settings
 from fyers_client import FyersClient
 
 INDEX_SPOT_TRADINGSYMBOL = {
@@ -36,11 +37,6 @@ INDIA_VIX_TRADINGSYMBOL = "INDIAVIX-INDEX"  # NSE's volatility index - one for t
 
 MARKET_OPEN_TIME = datetime.time(9, 15)  # NSE equity/F&O session open (IST) - used to bound
                                           # today's opening-range candles (see get_orb_bias).
-
-
-def load_settings(path="settings.json"):
-    with open(path, "r") as f:
-        return json.load(f)
 
 
 def _emit(on_event, payload):

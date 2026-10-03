@@ -46,7 +46,7 @@
   async function postJSON(url, body) {
     const resp = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": window.APP_CSRF_TOKEN || "" },
       body: JSON.stringify(body || {}),
     });
     const data = await resp.json().catch(() => ({}));
@@ -59,17 +59,6 @@
   // ------------------------------------------------------------ settings form
 
   const providerSelect = $("ai_provider");
-  const geminiField = $("geminiKeyField");
-  const claudeField = $("claudeKeyField");
-
-  function syncProviderFields() {
-    const isGemini = providerSelect.value === "gemini";
-    geminiField.style.display = isGemini ? "" : "none";
-    claudeField.style.display = isGemini ? "none" : "";
-  }
-  providerSelect.addEventListener("change", syncProviderFields);
-  syncProviderFields();
-
   function bindToggle(checkboxId, inputId) {
     const cb = $(checkboxId);
     const input = $(inputId);
@@ -117,7 +106,7 @@
     try {
       const resp = await fetch("/api/mode", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": window.APP_CSRF_TOKEN || "" },
         body: JSON.stringify({ live: goingLive }),
       });
       const data = await resp.json();
@@ -140,14 +129,9 @@
   $("settingsForm").addEventListener("submit", async (e) => {
     e.preventDefault();
     const payload = {
-      fyers_client_id: $("fyers_client_id").value.trim(),
-      fyers_secret_key: $("fyers_secret_key").value.trim(),
-      fyers_redirect_uri: $("fyers_redirect_uri").value.trim(),
       index: $("index").value.trim() || "NIFTY",
       lots: parseInt($("lots").value, 10) || 1,
       ai_provider: providerSelect.value,
-      gemini_api_key: $("gemini_api_key").value.trim(),
-      anthropic_api_key: $("anthropic_api_key").value.trim(),
       sl_enabled: $("sl_enabled").checked,
       max_loss: parseFloat($("max_loss").value) || 0,
       target_enabled: $("target_enabled").checked,
@@ -168,8 +152,6 @@
         enabled: $("proxy_enabled").checked,
         host: $("proxy_host").value.trim(),
         port: $("proxy_port").value.trim(),
-        user: $("proxy_user").value.trim(),
-        pass: $("proxy_pass").value,
       },
     };
     try {
@@ -329,16 +311,26 @@
 
   loginBtn.addEventListener("click", async () => {
     if (!window.__CONFIGURED__) {
-      toast("Save your FYERS/AI API keys in Settings first", "error");
+      toast("Set FYERS and AI credentials in the server environment, then reload.", "error");
       settingsPanel.classList.remove("collapsed");
       return;
     }
     loggingIn = true;
     refreshControlState();
-    setHint("Opening FYERS login in your browser - complete it there...", "info");
+    setHint("Opening FYERS authorization...", "info");
+    // Open synchronously in the click handler so browser popup blockers allow
+    // the authorization window; navigation happens when the server responds.
+    const authWindow = window.open("about:blank", "fyersAuthorization");
     try {
-      await postJSON("/api/login", {});
+      const result = await postJSON("/api/login", {});
+      if (result.auth_url) {
+        if (authWindow) authWindow.location = result.auth_url;
+        else window.location.assign(result.auth_url);
+      } else if (authWindow) {
+        authWindow.close();
+      }
     } catch (err) {
+      if (authWindow) authWindow.close();
       toast("Login failed to start: " + err.message, "error");
       loggingIn = false;
       refreshControlState();
@@ -353,7 +345,7 @@
       return;
     }
     if (!window.__CONFIGURED__) {
-      toast("Save your FYERS/AI API keys in Settings first", "error");
+      toast("Set FYERS and AI credentials in the server environment, then reload.", "error");
       settingsPanel.classList.remove("collapsed");
       return;
     }
@@ -618,8 +610,7 @@
   socket.on("login_status", (data) => {
     if (data.status === "waiting") {
       loggingIn = true;
-      setHint("Waiting for you to finish logging in to FYERS in the other browser tab (up to 4 minutes)... " +
-        "If that tab shows \"connection refused\", paste its URL into the box below instead.", "info");
+      setHint("Complete FYERS authorization in the popup. It will return to this dashboard when done.", "info");
     } else if (data.status === "success") {
       loggingIn = false;
       loggedIn = true;
@@ -635,11 +626,10 @@
       loggedIn = false;
       setHint(
         "Login failed: " + (data.message || "unknown error") +
-        " — double-check your FYERS app's Redirect URL is set to EXACTLY http://127.0.0.1:5000/ " +
-        "(with the port and trailing slash) in the FYERS developer console, or use the paste-token box below instead.",
+        " — confirm FYERS_REDIRECT_URI exactly matches the redirect URL registered in your FYERS app settings.",
         "error"
       );
-      toast("FYERS login failed - see the note under the Login button", "error");
+      toast("FYERS login failed - check the registered callback URL", "error");
     }
     refreshControlState();
   });

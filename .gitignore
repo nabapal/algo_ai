@@ -1,6 +1,9 @@
 # Local credentials and session tokens
 /settings.json
 /token.json
+/.env
+/.env.*
+!/.env.example
 
 # Runtime state, logs, and Python cache
 /last_analysis_state.json

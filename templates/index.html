@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NIFTY Options Engine</title>
+<title>Index Options Engine</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -16,7 +16,7 @@
 <header class="topbar">
   <div class="topbar-left">
     <span class="logo-dot"></span>
-    <span class="app-title">NIFTY Options Engine</span>
+    <span class="app-title">Index Options Engine</span>
     <span id="serverStartedBadge" class="server-started-badge" title="When this python app.py process started - refresh alone does not restart it">
       Server started {{ restart.server_started_at if restart is defined and restart else '?' }}
     </span>
@@ -27,6 +27,10 @@
       {{ 'DRY RUN' if settings.dry_run else 'LIVE' }}
     </button>
     <button id="settingsToggleBtn" class="icon-btn" title="Settings">⚙ Settings</button>
+    <form action="{{ url_for('logout') }}" method="post" class="logout-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="icon-btn">Log out</button>
+    </form>
   </div>
 </header>
 
@@ -42,27 +46,29 @@
   <section id="settingsPanel" class="card settings-card {{ '' if not configured else 'collapsed' }}">
     <div class="card-header">
       <h2>Settings</h2>
-      <span class="muted">Saved only to settings.json on this machine.</span>
+      <span class="muted">Credentials are read from the server environment.</span>
     </div>
 
     <form id="settingsForm" class="settings-grid">
 
-      <div class="field">
-        <label for="fyers_client_id">FYERS App ID</label>
-        <input type="text" id="fyers_client_id" autocomplete="off" value="{{ settings.fyers_client_id }}">
-      </div>
-      <div class="field">
-        <label for="fyers_secret_key">FYERS Secret Key</label>
-        <input type="password" id="fyers_secret_key" autocomplete="off" value="{{ settings.fyers_secret_key }}">
-      </div>
-      <div class="field">
-        <label for="fyers_redirect_uri">FYERS Redirect URI</label>
-        <input type="text" id="fyers_redirect_uri" autocomplete="off" value="{{ settings.fyers_redirect_uri }}">
+      <div class="field env-credentials">
+        <strong>Environment credentials</strong>
+        <span>FYERS app: {{ 'configured' if credential_status.fyers else 'missing' }}</span>
+        <span>Gemini key: {{ 'configured' if credential_status.gemini else 'missing' }}</span>
+        <span>Anthropic key: {{ 'configured' if credential_status.anthropic else 'missing' }}</span>
+        <small>Set FYERS_CLIENT_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URI, GEMINI_API_KEY,
+          ANTHROPIC_API_KEY and AI_PROVIDER in the server environment. Secrets are never shown here.</small>
       </div>
 
       <div class="field">
-        <label for="index">Index (view-only - edit settings.json directly to change)</label>
-        <input type="text" id="index" autocomplete="off" value="{{ settings.index }}" readonly>
+        <label for="index">Options instrument</label>
+        <select id="index">
+          <option value="NIFTY" {{ 'selected' if settings.index == 'NIFTY' }}>NIFTY 50</option>
+          <option value="BANKNIFTY" {{ 'selected' if settings.index == 'BANKNIFTY' }}>BANK NIFTY</option>
+          <option value="FINNIFTY" {{ 'selected' if settings.index == 'FINNIFTY' }}>FINNIFTY</option>
+          <option value="MIDCPNIFTY" {{ 'selected' if settings.index == 'MIDCPNIFTY' }}>MIDCPNIFTY</option>
+        </select>
+        <small>Applies to the next analysis or execution. Stop the engine before changing it.</small>
       </div>
       <div class="field">
         <label for="lots">Lots</label>
@@ -71,19 +77,12 @@
 
       <div class="field">
         <label for="ai_provider">AI Provider</label>
-        <select id="ai_provider">
+        <select id="ai_provider" {{ 'disabled' if env_provider }}>
           <option value="gemini" {{ 'selected' if settings.ai_provider == 'gemini' }}>Gemini</option>
           <option value="claude" {{ 'selected' if settings.ai_provider == 'claude' }}>Claude</option>
         </select>
       </div>
-      <div class="field" id="geminiKeyField">
-        <label for="gemini_api_key">Gemini API Key</label>
-        <input type="text" id="gemini_api_key" autocomplete="off" value="{{ settings.gemini_api_key }}">
-      </div>
-      <div class="field" id="claudeKeyField">
-        <label for="anthropic_api_key">Claude (Anthropic) API Key</label>
-        <input type="password" id="anthropic_api_key" autocomplete="off" value="{{ settings.anthropic_api_key }}">
-      </div>
+      {% if env_provider %}<div class="field muted small">AI provider is fixed by the AI_PROVIDER environment variable.</div>{% endif %}
 
       <div class="field toggle-field">
         <div class="toggle-row">
@@ -143,14 +142,7 @@
             <label for="proxy_port">Proxy Port</label>
             <input type="text" id="proxy_port" value="{{ settings.proxy.port }}">
           </div>
-          <div class="field">
-            <label for="proxy_user">Proxy User</label>
-            <input type="text" id="proxy_user" value="{{ settings.proxy.user }}">
-          </div>
-          <div class="field">
-            <label for="proxy_pass">Proxy Password</label>
-            <input type="text" id="proxy_pass" value="{{ settings.proxy.pass }}">
-          </div>
+          <div class="field muted small">Optional proxy credentials come from PROXY_USERNAME and PROXY_PASSWORD environment variables.</div>
         </div>
       </details>
 
@@ -274,8 +266,7 @@
     <div id="engineProgressText" class="progress-text" style="display:none;"></div>
 
     <div class="manual-login-row">
-      <span class="muted small">Redirect page not reachable after login? Paste that page's URL (or just the
-        auth_code) here instead:</span>
+      <span class="muted small">If FYERS callback cannot finish automatically, paste the redirect URL or auth_code here:</span>
       <div class="manual-login-inputs">
         <input type="text" id="manualTokenInput" placeholder="FYERS redirect URL with auth_code=... or just the auth code">
         <button id="manualLoginBtn" class="btn btn-secondary">Submit Token</button>
@@ -476,6 +467,7 @@
 <script src="{{ url_for('static', filename='lightweight-charts.standalone.production.js') }}"></script>
 <script>
   window.__CONFIGURED__ = {{ 'true' if configured else 'false' }};
+  window.APP_CSRF_TOKEN = {{ csrf_token | tojson }};
 </script>
 <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
 </body>

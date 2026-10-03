@@ -9,29 +9,33 @@ This file does NOT re-implement any trading/analysis logic - it only:
     WebSocket (Flask-SocketIO), and relays "Stop" clicks to the same
     stop_event that engine.py's monitoring loop already checks
 
-Run with `python app.py` (or run.bat / run.sh). Opens your browser to
-http://127.0.0.1:5050 automatically. This is a local-only tool - it binds
-to 127.0.0.1 (not 0.0.0.0), so nothing outside this machine can reach it.
+Run with `python app.py` (or run.bat / run.sh). By default the dashboard
+binds to 0.0.0.0:5050 for access through the machine's network interfaces.
+Set HOST=127.0.0.1 to restrict it to local access.
 """
 
 import datetime
+import hmac
 import json
 import os
+import secrets
 import threading
+import time
 import webbrowser
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 from flask_socketio import SocketIO
 
+from app_config import DATA_DIR, SETTINGS_PATH, env_setting_is_set, load_settings, save_settings
 import ai_sentiment
 import engine
 import option_signal
-from fyers_client import FyersClient, extract_request_token, load_cached_access_token
+from fyers_client import INDEX_SYMBOLS, FyersClient, extract_request_token, load_cached_access_token
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 LAST_ANALYSIS_PATH = os.path.join(BASE_DIR, "last_analysis_state.json")
-PORT = 5050  # deliberately different from the FYERS redirect port 5000
+PORT = int(os.environ.get("PORT", "5050"))
+SUPPORTED_INDEXES = frozenset(INDEX_SYMBOLS)
 
 # Editing a .py file never hot-reloads a running Python process - only a
 # full restart of `python app.py` picks up new code (unlike templates/
@@ -43,7 +47,7 @@ PORT = 5050  # deliberately different from the FYERS redirect port 5000
 # any of them changed after this process started, we know for certain a
 # restart is needed and can say so plainly instead of guessing.
 SERVER_STARTED_AT = datetime.datetime.now()
-_WATCHED_PY_FILES = ["app.py", "engine.py", "fyers_client.py", "option_signal.py", "ai_sentiment.py", "decision.py"]
+_WATCHED_PY_FILES = ["app.py", "app_config.py", "engine.py", "fyers_client.py", "option_signal.py", "ai_sentiment.py", "decision.py"]
 
 
 def _code_last_modified():
@@ -65,9 +69,122 @@ def restart_status():
     }
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.urandom(24).hex()
+app.config["SECRET_KEY"] = os.environ.get("APP_SESSION_SECRET") or os.urandom(32).hex()
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get(
+    "COOKIE_SECURE", "true" if os.environ.get("APP_ENV", "").lower() == "production" else "false"
+).lower() in {"1", "true", "yes"}
+app.config["PERMANENT_SESSION_LIFETIME"] = datetime.timedelta(hours=8)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 socketio = SocketIO(app, async_mode="threading")
+
+LOGIN_FAILURES = {}
+LOGIN_FAILURES_LOCK = threading.Lock()
+OAUTH_PENDING = {}
+OAUTH_PENDING_LOCK = threading.Lock()
+LOGIN_MAX_FAILURES = 8
+LOGIN_WINDOW_SECONDS = 15 * 60
+
+
+def _login_credentials():
+    return os.environ.get("APP_USERNAME", ""), os.environ.get("APP_PASSWORD", "")
+
+
+def _login_environment_ready():
+    username, password = _login_credentials()
+    session_secret = os.environ.get("APP_SESSION_SECRET", "")
+    return bool(
+        username and username != "change-this-username"
+        and len(password) >= 16 and not password.startswith("replace-with-")
+        and len(session_secret) >= 32 and not session_secret.startswith("replace-with-")
+    )
+
+
+def _csrf_token():
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_urlsafe(32)
+    return session["csrf_token"]
+
+
+@app.before_request
+def require_dashboard_login():
+    if request.endpoint in {"login_page", "login_submit", "static"}:
+        return None
+    if session.get("authenticated"):
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            sent = request.headers.get("X-CSRF-Token", "") or request.form.get("csrf_token", "")
+            expected = session.get("csrf_token", "")
+            if not sent or not expected or not hmac.compare_digest(sent, expected):
+                return jsonify({"ok": False, "error": "invalid or missing CSRF token"}), 400
+        return None
+    if request.path.startswith("/api/") or request.path.startswith("/socket.io"):
+        return jsonify({"ok": False, "error": "login required"}), 401
+    return redirect(url_for("login_page", next=request.path))
+
+
+@socketio.on("connect")
+def require_socket_login(auth=None):
+    if not session.get("authenticated"):
+        return False
+
+
+@app.route("/login", methods=["GET"])
+def login_page():
+    if session.get("authenticated"):
+        return redirect(url_for("index"))
+    ready = _login_environment_ready()
+    return render_template("login.html", error=None, csrf_token=_csrf_token(), login_ready=ready)
+
+
+@app.route("/auth/login", methods=["POST"])
+def login_submit():
+    csrf = request.form.get("csrf_token", "")
+    if not csrf or not hmac.compare_digest(csrf, session.get("csrf_token", "")):
+        return render_template("login.html", error="Login form expired. Please try again.",
+                               csrf_token=_csrf_token(), login_ready=True), 400
+
+    username, password = _login_credentials()
+    if not _login_environment_ready():
+        return render_template("login.html", error="Set APP_USERNAME, an APP_PASSWORD of at least 16 characters, and an APP_SESSION_SECRET of at least 32 characters, then restart the app.",
+                               csrf_token=_csrf_token(), login_ready=False), 503
+
+    now = time.time()
+    remote = request.remote_addr or "unknown"
+    with LOGIN_FAILURES_LOCK:
+        failures, started = LOGIN_FAILURES.get(remote, (0, now))
+        if now - started >= LOGIN_WINDOW_SECONDS:
+            failures, started = 0, now
+        if failures >= LOGIN_MAX_FAILURES:
+            return render_template("login.html", error="Too many failed attempts. Wait 15 minutes and try again.",
+                                   csrf_token=_csrf_token(), login_ready=True), 429
+
+    submitted_username = request.form.get("username", "")
+    submitted_password = request.form.get("password", "")
+    valid_user = hmac.compare_digest(submitted_username.encode(), username.encode())
+    valid_password = hmac.compare_digest(submitted_password.encode(), password.encode())
+    if not (valid_user and valid_password):
+        with LOGIN_FAILURES_LOCK:
+            LOGIN_FAILURES[remote] = (failures + 1, started)
+        return render_template("login.html", error="Incorrect username or password.",
+                               csrf_token=_csrf_token(), login_ready=True), 401
+
+    with LOGIN_FAILURES_LOCK:
+        LOGIN_FAILURES.pop(remote, None)
+    session.clear()
+    session["authenticated"] = True
+    session["csrf_token"] = secrets.token_urlsafe(32)
+    session.permanent = True
+    next_path = request.form.get("next", "/")
+    if not next_path.startswith("/") or next_path.startswith("//"):
+        next_path = "/"
+    return redirect(next_path)
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login_page"))
 
 STATE_LOCK = threading.Lock()
 STATE = {
@@ -117,16 +234,6 @@ def _save_last_analysis_to_disk():
 
 
 STATE["last_universe_event"], STATE["last_decision_event"] = _load_last_analysis_from_disk()
-
-
-def load_settings():
-    with open(SETTINGS_PATH, "r") as f:
-        return json.load(f)
-
-
-def save_settings(settings):
-    with open(SETTINGS_PATH, "w") as f:
-        json.dump(settings, f, indent=2)
 
 
 def settings_configured(settings):
@@ -234,8 +341,22 @@ def _get_spot_instrument(kite_client, settings):
 @app.route("/")
 def index():
     settings = load_settings()
-    return render_template("index.html", settings=settings, configured=settings_configured(settings),
-                            restart=restart_status())
+    ui_settings = dict(settings)
+    if ui_settings.get("index") not in SUPPORTED_INDEXES:
+        ui_settings["index"] = "NIFTY"
+    for key in ("fyers_client_id", "fyers_secret_key", "gemini_api_key", "anthropic_api_key"):
+        ui_settings.pop(key, None)
+    ui_settings["proxy"] = dict(settings.get("proxy", {}))
+    ui_settings["proxy"].pop("user", None)
+    ui_settings["proxy"].pop("pass", None)
+    return render_template("index.html", settings=ui_settings, configured=settings_configured(settings),
+                           restart=restart_status(), csrf_token=session.get("csrf_token", ""),
+                           env_provider=env_setting_is_set("ai_provider"),
+                           credential_status={
+                               "fyers": env_setting_is_set("fyers_client_id") and env_setting_is_set("fyers_secret_key"),
+                               "gemini": env_setting_is_set("gemini_api_key"),
+                               "anthropic": env_setting_is_set("anthropic_api_key"),
+                           })
 
 
 # --------------------------------------------------------------- settings
@@ -243,6 +364,12 @@ def index():
 @app.route("/api/settings", methods=["GET"])
 def get_settings():
     settings = load_settings()
+    # Never send credentials back to the dashboard, even if an old local
+    # settings.json still contains them.
+    for key in ("fyers_client_id", "fyers_secret_key", "gemini_api_key", "anthropic_api_key"):
+        settings.pop(key, None)
+    if isinstance(settings.get("proxy"), dict):
+        settings["proxy"] = {k: v for k, v in settings["proxy"].items() if k not in {"user", "pass"}}
     return jsonify({"settings": settings, "configured": settings_configured(settings)})
 
 
@@ -258,8 +385,16 @@ def update_settings():
     # deliberately NOT editable from this endpoint - dry_run especially is
     # left as a manual settings.json edit on purpose, so nobody can flip
     # live trading on with one misplaced click (see README).
-    str_fields = ["fyers_client_id", "fyers_secret_key", "fyers_redirect_uri", "ai_provider", "gemini_api_key",
-                  "gemini_model", "anthropic_api_key", "claude_model", "index", "time_exit",
+    if "index" in incoming:
+        requested_index = str(incoming["index"]).strip().upper()
+        if requested_index not in SUPPORTED_INDEXES:
+            return jsonify({"ok": False, "error": "Choose a supported index: NIFTY, BANKNIFTY, FINNIFTY, or MIDCPNIFTY."}), 400
+        with STATE_LOCK:
+            if STATE["running"] and requested_index != settings.get("index"):
+                return jsonify({"ok": False, "error": "Stop the engine before changing the options instrument."}), 400
+        settings["index"] = requested_index
+
+    str_fields = ["ai_provider", "gemini_model", "claude_model", "time_exit",
                   "custom_ai_note"]
     for field in str_fields:
         if field in incoming:
@@ -454,42 +589,80 @@ def login():
 
     settings = load_settings()
     if not settings.get("fyers_client_id") or not settings.get("fyers_secret_key"):
-        return jsonify({"ok": False, "error": "FYERS App ID/secret not set - save Settings first"}), 400
+        return jsonify({"ok": False, "error": "Set FYERS_CLIENT_ID and FYERS_SECRET_KEY in the server environment."}), 400
+    if not env_setting_is_set("fyers_redirect_uri"):
+        settings["fyers_redirect_uri"] = url_for("fyers_callback", _external=True)
 
-    log = _make_log()
-    # Whatever host the browser used to reach THIS request (localhost when
-    # run locally, the VM's public IP when deployed remotely) - purely
-    # cosmetic (see complete_login's docstring), so it bounces the user back
-    # to wherever they actually are instead of always assuming localhost.
-    dashboard_url = request.host_url
+    client = FyersClient(settings, log=_make_log())
+    cached = load_cached_access_token()
+    if cached:
+        client.set_access_token(cached)
+        with STATE_LOCK:
+            STATE["kite_client"] = client
+            STATE["logged_in"] = True
+        socketio.emit("login_status", {"status": "success", "source": "auto"})
+        _resume_existing_position_if_any(_make_log())
+        return jsonify({"ok": True, "cached": True})
 
-    def _do_login():
-        socketio.emit("login_status", {"status": "waiting", "source": "auto"})
-        try:
-            client = FyersClient(settings, log=log)
-            client.login(redirect_display_url=dashboard_url)
-            with STATE_LOCK:
-                STATE["kite_client"] = client
-                STATE["logged_in"] = True
-            socketio.emit("login_status", {"status": "success", "source": "auto"})
-            _resume_existing_position_if_any(log)
-        except Exception as exc:  # noqa: BLE001 - surface any failure to the UI, never crash the server
-            log(f"[app] login failed: {exc!r}")
-            socketio.emit("login_status", {"status": "error", "message": str(exc), "source": "auto"})
+    oauth_state = secrets.token_urlsafe(32)
+    try:
+        auth_url = client.generate_auth_url(oauth_state)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"could not create FYERS authorization URL: {exc}"}), 502
 
-    threading.Thread(target=_do_login, daemon=True).start()
-    return jsonify({"ok": True, "message": "Login started - complete it in the browser tab that just opened."})
+    with OAUTH_PENDING_LOCK:
+        now = time.time()
+        for old_state, pending in list(OAUTH_PENDING.items()):
+            if pending["expires"] <= now:
+                OAUTH_PENDING.pop(old_state, None)
+        OAUTH_PENDING[oauth_state] = {"client": client, "expires": now + 600}
+    session["fyers_oauth_state"] = oauth_state
+    socketio.emit("login_status", {"status": "waiting", "source": "auto"})
+    return jsonify({"ok": True, "auth_url": auth_url})
+
+
+@app.route("/auth/fyers/callback", methods=["GET"])
+def fyers_callback():
+    oauth_state = request.args.get("state", "")
+    auth_code = request.args.get("auth_code", "")
+    if not oauth_state or not hmac.compare_digest(oauth_state, session.get("fyers_oauth_state", "")):
+        socketio.emit("login_status", {"status": "error", "message": "OAuth state did not match. Start Login again.", "source": "auto"})
+        return render_template("auth_callback.html", success=False,
+                               message="This login link expired or did not match your browser session. Start Login again."), 400
+    with OAUTH_PENDING_LOCK:
+        pending = OAUTH_PENDING.pop(oauth_state, None)
+    session.pop("fyers_oauth_state", None)
+    if not pending or pending["expires"] < time.time():
+        socketio.emit("login_status", {"status": "error", "message": "The login request expired. Start Login again.", "source": "auto"})
+        return render_template("auth_callback.html", success=False,
+                               message="The login request expired. Return to the dashboard and start Login again."), 400
+    if not auth_code:
+        message = request.args.get("error", "FYERS did not return an authorization code.")
+        socketio.emit("login_status", {"status": "error", "message": message, "source": "auto"})
+        return render_template("auth_callback.html", success=False, message=message), 400
+
+    client = pending["client"]
+    try:
+        client.complete_login(auth_code)
+        with STATE_LOCK:
+            STATE["kite_client"] = client
+            STATE["logged_in"] = True
+        socketio.emit("login_status", {"status": "success", "source": "auto"})
+        _resume_existing_position_if_any(_make_log())
+        return render_template("auth_callback.html", success=True,
+                               message="FYERS login complete. Return to the dashboard.")
+    except Exception as exc:  # noqa: BLE001
+        _make_log()(f"[fyers] callback token exchange failed: {exc!r}")
+        socketio.emit("login_status", {"status": "error", "message": str(exc), "source": "auto"})
+        return render_template("auth_callback.html", success=False,
+                               message="FYERS could not verify this login code. Return to the dashboard and try again."), 400
 
 
 @app.route("/api/login/manual", methods=["POST"])
 def login_manual():
     """
-    Fallback for when the automatic local redirect-catcher (port 5000)
-    never gets FYERS callback - usually because the FYERS app redirect
-    URL isn't registered as exactly http://127.0.0.1:5000/. The user
-    completes login in the browser as usual, then pastes whatever URL/page
-    they landed on (even an error page) here - we just need the
-    request_token out of its query string.
+    Fallback token exchange for a user who needs to paste an authorization
+    code instead of completing the hosted callback automatically.
     """
     with STATE_LOCK:
         if STATE["running"]:
@@ -497,7 +670,7 @@ def login_manual():
 
     settings = load_settings()
     if not settings.get("fyers_client_id") or not settings.get("fyers_secret_key"):
-        return jsonify({"ok": False, "error": "FYERS App ID/secret not set - save Settings first"}), 400
+        return jsonify({"ok": False, "error": "Set FYERS_CLIENT_ID and FYERS_SECRET_KEY in the server environment."}), 400
 
     incoming = request.get_json(force=True, silent=True) or {}
     raw_input = str(incoming.get("token_input", ""))
@@ -761,15 +934,11 @@ def _try_restore_session():
 
 if __name__ == "__main__":
     _try_restore_session()
-    # HOST defaults to 127.0.0.1 (local-only, unreachable from outside this
-    # machine - see module docstring). Set HOST=0.0.0.0 only when deploying
-    # on a remote server (e.g. a cloud VM whose static IP is registered in
-    # Kite's IP Whitelist for order placement) that you intend to reach from
-    # elsewhere - then also lock down inbound access at the firewall/security
-    # list level instead of relying on this app for that.
-    host = os.environ.get("HOST", "127.0.0.1")
+    # Bind to all interfaces by default so the dashboard is reachable on a
+    # cloud VM. Restrict inbound access with the VM/cloud firewall.
+    host = os.environ.get("HOST", "0.0.0.0")
     local_url = f"http://127.0.0.1:{PORT}"
-    if host == "127.0.0.1":
+    if host in {"127.0.0.1", "localhost"}:
         threading.Timer(1.2, lambda: webbrowser.open(local_url)).start()
         print(f"[app] starting dashboard at {local_url}")
     else:

@@ -1,9 +1,7 @@
 # NIFTY Weekly Options - Semi-Automated Intraday BUYING Engine
 
-A local, single-user tool for semi-automated intraday BUYING of NIFTY weekly
-options via FYERS API v3, with a web dashboard on top. Everything
-runs on your own machine - nothing is hosted, nothing leaves your computer
-except calls to FYERS API and your chosen AI provider's API.
+A single-user tool for semi-automated intraday BUYING of NIFTY weekly
+options via FYERS API v3, with a password-protected web dashboard.
 
 ## ⚠️ Disclaimer
 
@@ -36,11 +34,19 @@ never risk money you can't afford to lose.
 **Windows:** double-click [run.bat](run.bat)
 **Mac/Linux:** `./run.sh`
 
-On a fresh checkout, first create your local settings file from the safe template:
+On a fresh checkout, create the local environment file and fill in the
+placeholders. `.env` is ignored by Git and is only for local development;
+on Render or Oracle, enter the same values in the service's environment settings.
 
 ```powershell
-Copy-Item settings.example.json settings.json
+Copy-Item .env.example .env
 ```
+
+Set a long unique `APP_PASSWORD` and a random `APP_SESSION_SECRET` (at least
+32 characters; `python -c "import secrets; print(secrets.token_urlsafe(48))"`
+prints one). Add your FYERS and AI API values to `.env`. Strategy preferences
+are stored separately in `settings.json`; the app initializes safe defaults
+from `settings.example.json` if that file does not exist.
 
 Then start the app as usual:
 
@@ -49,8 +55,47 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Your browser opens automatically to `http://127.0.0.1:5050`. Nothing is
-exposed outside your machine (the server binds to 127.0.0.1 only).
+By default, the dashboard listens on all network interfaces at port `5050`.
+It requires the `APP_USERNAME` and `APP_PASSWORD` environment variables to
+sign in. For Oracle Cloud, put the app behind HTTPS and allow the dashboard
+port only from trusted sources or through your HTTPS reverse proxy.
+
+### Render deployment
+
+Create a **Web Service** (not a Static Site) connected to this repository.
+Leave Root Directory blank when the files are at the repository root. Set:
+
+| Render setting | Value |
+|---|---|
+| Build Command | `pip install -r requirements.txt` |
+| Start Command | `gunicorn -w 1 --threads 100 --bind 0.0.0.0:$PORT app:app` |
+
+There is no Publish Directory for this Flask app. Add these secrets under the
+Render service's Environment settings; never commit real values:
+
+| Variable | Value |
+|---|---|
+| `APP_USERNAME` | Your dashboard username |
+| `APP_PASSWORD` | Long, unique dashboard password (16+ characters) |
+| `APP_SESSION_SECRET` | Random secret (32+ characters) |
+| `APP_ENV` | `production` |
+| `COOKIE_SECURE` | `true` |
+| `FYERS_CLIENT_ID` | FYERS App ID |
+| `FYERS_SECRET_KEY` | FYERS secret |
+| `FYERS_REDIRECT_URI` | `https://<your-service>.onrender.com/auth/fyers/callback` |
+| `AI_PROVIDER` | `gemini` or `claude` |
+| `GEMINI_API_KEY` | Gemini key, when using Gemini |
+| `ANTHROPIC_API_KEY` | Anthropic key, when using Claude |
+| `GEMINI_MODEL` / `CLAUDE_MODEL` | Optional model overrides |
+| `PROXY_USERNAME` / `PROXY_PASSWORD` | Optional proxy credentials |
+
+Register the exact `FYERS_REDIRECT_URI` in the FYERS app settings. After
+Render gives you the service hostname, set that variable and redeploy. The
+Login button opens FYERS in your browser; FYERS returns to the hosted callback.
+For local development use `http://127.0.0.1:5050/auth/fyers/callback` instead.
+`DATA_DIR` can point to a mounted persistent disk for saved strategy settings
+and the daily token cache; without persistent storage, those local files may
+be lost on a Render restart (the environment secrets remain configured).
 
 **If you ever edit any of the `.py` files** (or pull an update) while the
 server is already running: refreshing the browser page alone is **not**
@@ -61,14 +106,10 @@ HH:MM:SS", and a bold red banner appears automatically (checked every 15s,
 no refresh needed) if any `.py` file changed after this process started,
 telling you exactly to close the terminal and run `python app.py` again.
 
-The **Settings** panel opens automatically until the required credentials are
-filled in. `settings.json` is local-only and ignored by Git. Fill in:
-- **FYERS App ID / Secret Key** - from https://myapi.fyers.in/dashboard/. In that
-  app's settings, set the **Redirect URL** to exactly `http://127.0.0.1:5000/`
-  (a different port from the dashboard itself - this is the fixed address
-  the Login flow uses to catch FYERS's redirect).
-- **AI Provider** (Gemini or Claude) + that provider's API key.
-- **Lots**, and your **Stop Loss / Target / Time Exit** toggles + amounts.
+The dashboard sign-in uses `APP_USERNAME` and `APP_PASSWORD`. API credentials
+and FYERS redirect URL are configured through environment variables and are
+not shown in the dashboard or saved to `settings.json`. The Settings panel is
+for strategy preferences such as lots and Stop Loss / Target / Time Exit.
 
 Click **Save Settings**, then use the three Control buttons:
 

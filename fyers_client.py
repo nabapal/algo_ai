@@ -10,15 +10,24 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 from fyers_apiv3 import fyersModel
+from app_config import DATA_DIR
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TOKEN_FILE = os.path.join(BASE_DIR, "token.json")
+TOKEN_FILE = os.path.join(DATA_DIR, "token.json")
 REDIRECT_HOST, REDIRECT_PORT = "127.0.0.1", 5000
 REDIRECT_URL = f"http://{REDIRECT_HOST}:{REDIRECT_PORT}/"
 LOGIN_TIMEOUT_SECONDS = 240
 INDEX_SYMBOLS = {"NIFTY": "NSE:NIFTY50-INDEX", "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
                  "FINNIFTY": "NSE:FINNIFTY-INDEX", "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX"}
 MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO_sym_master.json"
+# This dashboard only builds option universes for these index families. Keep
+# the cached derivative master limited to them instead of retaining every
+# stock and contract in NSE F&O for the lifetime of the process.
+MASTER_UNDERLYING_ALIASES = {
+    "NIFTY", "NIFTY50", "BANKNIFTY", "NIFTYBANK", "FINNIFTY",
+    "NIFTYFINSERVICE", "NIFTYFINANCIALSERVICES", "MIDCPNIFTY", "NIFTYMIDSELECT",
+}
+MASTER_SYMBOL_PREFIXES = ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY")
 
 
 def _today_str():
@@ -87,10 +96,14 @@ class FyersClient:
         self._last_tick_time = None
         self._master = None
 
-    def _session(self):
+    def _session(self, state="algo_ai"):
         return fyersModel.SessionModel(client_id=self.client_id, secret_key=self.secret,
             redirect_uri=self.redirect_uri, response_type="code", grant_type="authorization_code",
-            state="algo_ai")
+            state=state)
+
+    def generate_auth_url(self, state):
+        """Build the FYERS OAuth URL for a browser-based hosted callback."""
+        return self._session(state=state).generate_authcode()
 
     def login(self, redirect_display_url=None):
         cached = load_cached_access_token()
@@ -127,6 +140,7 @@ class FyersClient:
         if not token:
             raise RuntimeError(f"FYERS token exchange failed: {response}")
         self.set_access_token(token)
+        os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
         with open(TOKEN_FILE, "w", encoding="utf-8") as f:
             json.dump({"access_token": token, "date": _today_str(), "provider": "fyers"}, f)
         self.log("[fyers] login successful; access token cached for today")
@@ -151,6 +165,14 @@ class FyersClient:
                 if not isinstance(record, dict):
                     continue
                 try:
+                    symbol = str(record.get("symTicker") or api_symbol)
+                    tradingsymbol = symbol.split(":", 1)[-1]
+                    underlying = "".join(ch for ch in str(record.get("underSym") or "").upper()
+                                         if ch.isalnum())
+                    normalized_symbol = "".join(ch for ch in tradingsymbol.upper() if ch.isalnum())
+                    if (underlying not in MASTER_UNDERLYING_ALIASES
+                            and not normalized_symbol.startswith(MASTER_SYMBOL_PREFIXES)):
+                        continue
                     expiry_raw = record.get("expiryDate")
                     if not expiry_raw:
                         expiry = dt.date.max
@@ -163,9 +185,8 @@ class FyersClient:
                     exchange_type = int(record.get("exInstType") or 0)
                     kind = opt_type if opt_type in ("CE", "PE") else (
                         "FUT" if exchange_type in (11, 12, 13, 16, 17, 18, 25, 30) else "XX")
-                    symbol = str(record.get("symTicker") or api_symbol)
                     self._master.append({"instrument_token": str(record.get("fyToken") or ""),
-                        "tradingsymbol": symbol.split(":", 1)[-1], "symbol": symbol,
+                        "tradingsymbol": tradingsymbol, "symbol": symbol,
                         "lot_size": int(float(record.get("minLotSize") or 1)), "expiry": expiry,
                         "strike": float(record.get("strikePrice") or 0), "instrument_type": kind,
                         "name": str(record.get("underSym") or record.get("exSymName") or ""),
