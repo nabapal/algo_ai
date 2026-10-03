@@ -34,11 +34,17 @@ def _today_str():
     return dt.date.today().isoformat()
 
 
-def load_cached_access_token():
+def load_cached_access_token(client_id):
+    """Return today's token only when it belongs to the configured FYERS app."""
+    client_id = (client_id or "").strip()
+    if not client_id:
+        return None
     try:
         with open(TOKEN_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        return data.get("access_token") if data.get("date") == _today_str() and data.get("provider") == "fyers" else None
+        matches_app = data.get("client_id") == client_id
+        valid_today = data.get("date") == _today_str() and data.get("provider") == "fyers"
+        return data.get("access_token") if matches_app and valid_today else None
     except (OSError, ValueError):
         return None
 
@@ -106,7 +112,7 @@ class FyersClient:
         return self._session(state=state).generate_authcode()
 
     def login(self, redirect_display_url=None):
-        cached = load_cached_access_token()
+        cached = load_cached_access_token(self.client_id)
         if cached:
             self.set_access_token(cached)
             self.log("[fyers] reused today's cached access token")
@@ -142,7 +148,8 @@ class FyersClient:
         self.set_access_token(token)
         os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
         with open(TOKEN_FILE, "w", encoding="utf-8") as f:
-            json.dump({"access_token": token, "date": _today_str(), "provider": "fyers"}, f)
+            json.dump({"access_token": token, "date": _today_str(), "provider": "fyers",
+                       "client_id": self.client_id}, f)
         self.log("[fyers] login successful; access token cached for today")
 
     def set_access_token(self, token):

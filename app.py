@@ -594,7 +594,7 @@ def login():
         settings["fyers_redirect_uri"] = url_for("fyers_callback", _external=True)
 
     client = FyersClient(settings, log=_make_log())
-    cached = load_cached_access_token()
+    cached = load_cached_access_token(client.client_id)
     if cached:
         client.set_access_token(cached)
         with STATE_LOCK:
@@ -913,7 +913,7 @@ def _try_restore_session():
     settings = load_settings()
     if not settings.get("fyers_client_id") or not settings.get("fyers_secret_key"):
         return
-    cached_token = load_cached_access_token()
+    cached_token = load_cached_access_token(settings.get("fyers_client_id"))
     if not cached_token:
         return
     try:
