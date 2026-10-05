@@ -15,7 +15,19 @@ import re
 import requests
 
 
-def _fixed_prompt(market_context=None, custom_note=None):
+def _index_label(index):
+    """Return the human-readable name used in the AI prompt for a configured index."""
+    labels = {
+        "NIFTY": "NIFTY 50",
+        "BANKNIFTY": "NIFTY BANK (BANKNIFTY)",
+        "FINNIFTY": "NIFTY Financial Services (FINNIFTY)",
+        "MIDCPNIFTY": "NIFTY Midcap Select (MIDCPNIFTY)",
+    }
+    normalized = str(index or "NIFTY").strip().upper()
+    return labels.get(normalized, normalized)
+
+
+def _fixed_prompt(market_context=None, custom_note=None, index="NIFTY"):
     """
     Built fresh each call from a hardcoded template + today's date (system
     data, not user free-text) - still a single fixed instruction, so the AI
@@ -49,8 +61,10 @@ def _fixed_prompt(market_context=None, custom_note=None):
     read - never order quantity, instrument, or anything else.
     """
     today = datetime.date.today().strftime("%d %B %Y")
+    instrument = _index_label(index)
     prompt = (
-        f"Today is {today}. For INTRADAY NIFTY 50 trading today, research and weigh these "
+        f"Today is {today}. For INTRADAY {instrument} index-options trading today, "
+        f"research and weigh these "
         f"specific factors together:\n"
         f"1) Global cues: US market close (Dow Jones/S&P 500/Nasdaq) and today's Asian market "
         f"trend (Nikkei, Hang Seng, SGX Nifty/GIFT Nifty futures).\n"
@@ -58,9 +72,9 @@ def _fixed_prompt(market_context=None, custom_note=None):
         f"crude is generally negative for NIFTY.\n"
         f"3) USD/INR currency movement - a weakening rupee is generally negative for NIFTY.\n"
         f"4) Any major scheduled event today or this week that could cause unusual volatility: "
-        f"RBI monetary policy, US Fed/FOMC decision, big NIFTY-heavy-stock earnings, Union Budget, "
+        f"RBI monetary policy, US Fed/FOMC decision, major {instrument} constituent earnings, Union Budget, "
         f"elections, or geopolitical/war escalation news.\n"
-        f"5) General NIFTY 50 / Indian market news and sector sentiment.\n"
+        f"5) General {instrument} / Indian market news and sector sentiment.\n"
     )
 
     next_point = 6
@@ -111,7 +125,7 @@ def _fixed_prompt(market_context=None, custom_note=None):
         prompt += (
             f"{next_point}) Quantitative option-chain context already computed for right now (factor this "
             f"in too, alongside the above):\n"
-            f"   - NIFTY spot: {market_context.get('spot')}\n"
+            f"   - {instrument} spot: {market_context.get('spot')}\n"
             f"   - India VIX: {market_context.get('vix')}\n"
             f"   - VIX-implied expected move for today (anchored to today's open): "
             f"+/-{market_context.get('expected_move', 0):.0f} points\n"
@@ -162,17 +176,19 @@ def _parse_sentiment_json(text):
     return {"sentiment": sentiment, "reason": str(data.get("reason", "")).strip()}
 
 
-def _call_gemini(settings, market_context=None, custom_note=None, timeout=45, log=print):
+def _call_gemini(settings, market_context=None, custom_note=None, timeout=45, log=print, index="NIFTY"):
     api_key = settings["gemini_api_key"]
     model = settings["gemini_model"]
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
-    prompt = _fixed_prompt(market_context, custom_note)
+    prompt = _fixed_prompt(market_context, custom_note, index=index)
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "tools": [{"google_search": {}}],
     }
+    log(f"[ai_sentiment] Gemini request started (model={model}, Google Search grounding=enabled)")
     resp = requests.post(url, headers=headers, json=body, timeout=timeout)
+    log(f"[ai_sentiment] Gemini grounded request HTTP {resp.status_code}")
     if resp.status_code == 429:
         # Google Search grounding has its own, much smaller quota than the
         # base model on the free tier and can run out independently of it
@@ -186,6 +202,14 @@ def _call_gemini(settings, market_context=None, custom_note=None, timeout=45, lo
             "retrying this same call without live web search")
         body_no_search = {"contents": [{"parts": [{"text": prompt}]}]}
         resp = requests.post(url, headers=headers, json=body_no_search, timeout=timeout)
+        log(f"[ai_sentiment] Gemini non-grounded retry HTTP {resp.status_code}")
+    if not resp.ok:
+        try:
+            error_payload = resp.json().get("error", {})
+            error_message = error_payload.get("message", "")
+        except (ValueError, AttributeError):
+            error_message = ""
+        log(f"[ai_sentiment] Gemini API error: {error_message or resp.reason}")
     resp.raise_for_status()
     data = resp.json()
     parts = data["candidates"][0]["content"]["parts"]
@@ -193,7 +217,7 @@ def _call_gemini(settings, market_context=None, custom_note=None, timeout=45, lo
     return text
 
 
-def _call_claude(settings, market_context=None, custom_note=None, timeout=45):
+def _call_claude(settings, market_context=None, custom_note=None, timeout=45, index="NIFTY"):
     api_key = settings["anthropic_api_key"]
     model = settings["claude_model"]
     url = "https://api.anthropic.com/v1/messages"
@@ -205,7 +229,7 @@ def _call_claude(settings, market_context=None, custom_note=None, timeout=45):
     body = {
         "model": model,
         "max_tokens": 1536,
-        "messages": [{"role": "user", "content": _fixed_prompt(market_context, custom_note)}],
+        "messages": [{"role": "user", "content": _fixed_prompt(market_context, custom_note, index=index)}],
         "tools": [{"type": "web_search_20250305", "name": "web_search"}],
     }
     resp = requests.post(url, headers=headers, json=body, timeout=timeout)
@@ -215,6 +239,56 @@ def _call_claude(settings, market_context=None, custom_note=None, timeout=45):
         block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"
     )
     return text
+
+
+def _call_openai(settings, market_context=None, custom_note=None, timeout=45, log=print, index="NIFTY"):
+    """Call the OpenAI Responses API with web search and a strict sentiment schema."""
+    api_key = settings["openai_api_key"]
+    model = settings.get("openai_model") or "gpt-6-astra"
+    url = "https://api.openai.com/v1/responses"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": model,
+        "input": _fixed_prompt(market_context, custom_note, index=index),
+        "tools": [{"type": "web_search"}],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "market_sentiment",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "sentiment": {"type": "string", "enum": list(VALID_SENTIMENTS)},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["sentiment", "reason"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+    }
+
+    log(f"[ai_sentiment] OpenAI request started (model={model}, web_search=enabled)")
+    response = requests.post(url, headers=headers, json=body, timeout=timeout)
+    log(f"[ai_sentiment] OpenAI Responses API HTTP {response.status_code}")
+    if not response.ok:
+        try:
+            api_message = response.json().get("error", {}).get("message", "")
+        except (ValueError, AttributeError):
+            api_message = ""
+        log(f"[ai_sentiment] OpenAI API error: {api_message or response.reason}")
+    response.raise_for_status()
+
+    data = response.json()
+    output_parts = []
+    for item in data.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []):
+            if content.get("type") == "output_text":
+                output_parts.append(content.get("text", ""))
+    return "".join(output_parts)
 
 
 def get_ai_sentiment(settings, market_context=None, log=print):
@@ -233,19 +307,27 @@ def get_ai_sentiment(settings, market_context=None, log=print):
     fixed instruction or required response format.
     """
     provider = settings.get("ai_provider", "gemini")
+    index = settings.get("index", "NIFTY")
     custom_note = (settings.get("custom_ai_note") or "").strip() or None
     try:
         if provider == "gemini":
-            raw_text = _call_gemini(settings, market_context=market_context, custom_note=custom_note, log=log)
+            raw_text = _call_gemini(
+                settings, market_context=market_context, custom_note=custom_note, log=log, index=index
+            )
         elif provider == "claude":
-            raw_text = _call_claude(settings, market_context=market_context, custom_note=custom_note)
+            raw_text = _call_claude(settings, market_context=market_context, custom_note=custom_note, index=index)
+        elif provider == "openai":
+            raw_text = _call_openai(
+                settings, market_context=market_context, custom_note=custom_note, log=log, index=index
+            )
         else:
             log(f"[ai_sentiment] unknown ai_provider {provider!r}, using safe default")
             return dict(_SAFE_DEFAULT)
 
+        log(f"[ai_sentiment] raw response ({len(raw_text)} chars): {raw_text[:2000]!r}")
         parsed = _parse_sentiment_json(raw_text)
         if parsed is None:
-            log(f"[ai_sentiment] could not parse AI response, using safe default. raw={raw_text!r}")
+            log("[ai_sentiment] response was not valid sentiment JSON; using safe default")
             return dict(_SAFE_DEFAULT)
 
         log(f"[ai_sentiment] provider={provider} sentiment={parsed['sentiment']} reason={parsed['reason']!r}")
@@ -256,7 +338,7 @@ def get_ai_sentiment(settings, market_context=None, log=print):
         return dict(_SAFE_DEFAULT)
 
 
-def build_prompt_preview(custom_note=None):
+def build_prompt_preview(custom_note=None, index="NIFTY"):
     """
     Public, read-only preview of the exact fixed prompt (minus the
     market_context section, which only exists once numbers are computed
@@ -264,4 +346,4 @@ def build_prompt_preview(custom_note=None):
     the prompt is no longer invisible/hidden. Never used for an actual AI
     call - get_ai_sentiment() builds its own fresh copy at Execute time.
     """
-    return _fixed_prompt(market_context=None, custom_note=custom_note)
+    return _fixed_prompt(market_context=None, custom_note=custom_note, index=index)

@@ -56,8 +56,9 @@
         <span>FYERS app: {{ 'configured' if credential_status.fyers else 'missing' }}</span>
         <span>Gemini key: {{ 'configured' if credential_status.gemini else 'missing' }}</span>
         <span>Anthropic key: {{ 'configured' if credential_status.anthropic else 'missing' }}</span>
-        <small>Set FYERS_CLIENT_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URI, GEMINI_API_KEY,
-          ANTHROPIC_API_KEY and AI_PROVIDER in the server environment. Secrets are never shown here.</small>
+        <span>OpenAI API key: {{ 'configured' if credential_status.openai else 'missing' }}</span>
+        <small>Set FYERS_CLIENT_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URI, the API key for your selected AI provider,
+          and optionally AI_PROVIDER in the server environment. Secrets are never shown here.</small>
       </div>
 
       <div class="field">
@@ -80,6 +81,7 @@
         <select id="ai_provider" {{ 'disabled' if env_provider }}>
           <option value="gemini" {{ 'selected' if settings.ai_provider == 'gemini' }}>Gemini</option>
           <option value="claude" {{ 'selected' if settings.ai_provider == 'claude' }}>Claude</option>
+          <option value="openai" {{ 'selected' if settings.ai_provider == 'openai' }}>OpenAI (ChatGPT)</option>
         </select>
       </div>
       {% if env_provider %}<div class="field muted small">AI provider is fixed by the AI_PROVIDER environment variable.</div>{% endif %}
@@ -443,6 +445,42 @@
         <div id="positionsList" class="positions-list muted small">No open position.</div>
       </div>
 
+    </div>
+  </section>
+
+  <section class="card journal-card">
+    <div class="card-header">
+      <div>
+        <h2>Trading Journal</h2>
+        <span id="journalStatus" class="muted small">Account activity syncs from FYERS while logged in.</span>
+      </div>
+      <button id="journalSyncBtn" class="btn btn-secondary" type="button">Sync FYERS activity</button>
+    </div>
+    <div class="journal-summary" id="journalSummary">No journal data yet.</div>
+    <div class="journal-section">
+      <h3>Application recommendations</h3>
+      <p class="muted small">Underlying movement is measured 15, 30, and 60 minutes after each signal and at market close. This is signal tracking, separate from account P&amp;L.</p>
+      <div class="journal-table-wrap">
+        <table class="journal-table">
+          <thead><tr><th>Time (IST)</th><th>Run</th><th>Index / expiry</th><th>Decision</th><th>Upside</th><th>15 min</th><th>30 min</th><th>60 min</th><th>Close</th></tr></thead>
+          <tbody id="journalRecommendations"><tr><td colspan="9" class="muted">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="journal-section">
+      <h3>FYERS account activity</h3>
+      <p class="muted small">Includes orders and executions returned by FYERS, including manually placed or exited orders when present in the broker feeds.</p>
+      <div class="journal-table-wrap">
+        <table class="journal-table">
+          <thead><tr><th>Time</th><th>Source</th><th>Kind</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Status</th></tr></thead>
+          <tbody id="journalActivity"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="journal-section">
+      <h3>FYERS charges reports</h3>
+      <p class="muted small">Charge report responses are stored as received. A report may remain unavailable or provisional until FYERS publishes the day's charges.</p>
+      <div id="journalCharges" class="journal-charges muted small">No charge reports synced yet.</div>
     </div>
   </section>
 

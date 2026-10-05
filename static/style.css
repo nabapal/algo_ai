@@ -92,6 +92,21 @@ h2 {
 .env-credentials span, .env-credentials small { color: var(--text-secondary); }
 .env-credentials small { line-height: 1.5; }
 
+.journal-card .card-header { align-items: center; }
+.journal-card h2, .journal-section h3 { margin: 0; }
+.journal-section { margin-top: 20px; }
+.journal-section > p { margin: 6px 0 10px; }
+.journal-summary { color: var(--text-secondary); font-size: 13px; }
+.journal-table-wrap { max-width: 100%; overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
+.journal-table { width: 100%; border-collapse: collapse; font-size: 12px; white-space: nowrap; }
+.journal-table th, .journal-table td { padding: 9px 10px; text-align: left; border-bottom: 1px solid var(--border); }
+.journal-table th { color: var(--text-secondary); font-weight: 700; background: var(--bg); }
+.journal-table tr:last-child td { border-bottom: 0; }
+.journal-charges { display: grid; gap: 8px; }
+.journal-charge-row { border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+.journal-charge-row summary { cursor: pointer; color: var(--text-primary); font-weight: 600; }
+.journal-charge-row pre { max-width: 100%; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+
 .badge {
   font-size: 11px;
   font-weight: 700;

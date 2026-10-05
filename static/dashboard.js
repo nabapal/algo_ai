@@ -1025,6 +1025,93 @@
     }
   }
 
+  function journalTime(value) {
+    if (!value) return "—";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? escapeHtml(value) : date.toLocaleString("en-IN", {
+      timeZone: "Asia/Kolkata", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit",
+    });
+  }
+
+  function journalOutcome(value) {
+    if (!value) return "Pending";
+    if (value.status === "unavailable") return "Unavailable";
+    const move = Number(value.move_points || 0);
+    const text = `${move >= 0 ? "+" : ""}${move.toFixed(1)} pts`;
+    if (value.directional_correct === true) return `Correct · ${text}`;
+    if (value.directional_correct === false) return `Wrong · ${text}`;
+    return text;
+  }
+
+  async function loadJournal() {
+    const response = await fetch("/api/journal?limit=100");
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || "Journal could not be loaded");
+    const recs = data.recommendations || [];
+    const activity = data.activity || [];
+    const charges = data.charges || [];
+    const captured = recs.filter(r => !r.manual);
+    const tracked = captured.flatMap(r => [r.outcomes?.["15m"], r.outcomes?.close])
+      .filter(o => o && typeof o.directional_correct === "boolean");
+    const correct = tracked.filter(o => o.directional_correct).length;
+    $("journalSummary").textContent =
+      `${captured.length} analyzed recommendations · ${correct}/${tracked.length} directional checks correct · ` +
+      `${activity.filter(x => x.kind === "order").length} FYERS orders · ` +
+      `${activity.filter(x => x.kind === "trade").length} executions · ${charges.length} charge report(s)`;
+
+    $("journalRecommendations").innerHTML = recs.length ? recs.map(r => {
+      const universe = r.universe || {};
+      const payload = r.payload || {};
+      const expiry = universe.nearest_expiry ? ` · ${universe.nearest_expiry}` : "";
+      const upside = Number.isFinite(Number(r.upside_probability))
+        ? `${Math.round(Number(r.upside_probability) * 100)}%` : "—";
+      return `<tr><td>${journalTime(r.created_at)}</td><td>${escapeHtml(payload.run_kind || (r.manual ? "manual" : "analysis"))}</td>` +
+        `<td>${escapeHtml(r.index_name || universe.index || "—")}${escapeHtml(expiry)}</td>` +
+        `<td>${escapeHtml(r.direction || "—")}</td><td>${upside}</td>` +
+        `<td>${escapeHtml(journalOutcome(r.outcomes?.["15m"]))}</td>` +
+        `<td>${escapeHtml(journalOutcome(r.outcomes?.["30m"]))}</td>` +
+        `<td>${escapeHtml(journalOutcome(r.outcomes?.["60m"]))}</td>` +
+        `<td>${escapeHtml(journalOutcome(r.outcomes?.close))}</td></tr>`;
+    }).join("") : `<tr><td colspan="9" class="muted">No recommendations recorded yet.</td></tr>`;
+
+    $("journalActivity").innerHTML = activity.length ? activity.map(item => {
+      const price = item.price == null ? "—" : fmtMoney(Number(item.price));
+      const sourceLabels = { M: "FYERS App", W: "FYERS Web", A: "Admin", ITS: "API" };
+      const source = sourceLabels[item.source] || item.source || "UNKNOWN";
+      return `<tr><td>${journalTime(item.event_time || item.synced_at)}</td><td>${escapeHtml(source)}</td>` +
+        `<td>${escapeHtml(item.kind)}</td><td>${escapeHtml(item.symbol || "—")}</td>` +
+        `<td>${escapeHtml(item.side || "—")}</td><td>${escapeHtml(item.quantity ?? "—")}</td>` +
+        `<td>${escapeHtml(price)}</td><td>${escapeHtml(item.status || "—")}</td></tr>`;
+    }).join("") : `<tr><td colspan="8" class="muted">No FYERS account activity received yet. Log in, then sync.</td></tr>`;
+
+    $("journalCharges").innerHTML = charges.length ? charges.map(report => {
+      const total = report.total == null ? "FYERS report received" : `Reported total ${fmtMoney(Number(report.total))}`;
+      return `<details class="journal-charge-row"><summary>${escapeHtml(report.report_date)} · ${escapeHtml(total)}</summary>` +
+        `<pre>${escapeHtml(JSON.stringify(report.raw, null, 2))}</pre></details>`;
+    }).join("") : "No FYERS charge report synced yet.";
+    $("journalStatus").textContent = "Saved locally in the persistent application data directory.";
+  }
+
+  $("journalSyncBtn").addEventListener("click", async () => {
+    const button = $("journalSyncBtn");
+    button.disabled = true;
+    $("journalStatus").textContent = "Syncing order book, trade book, and charges from FYERS…";
+    try {
+      const result = await postJSON("/api/journal/sync", {});
+      await loadJournal();
+      toast(`Synced ${result.orders} orders and ${result.trades} executions`, "success");
+      if (result.charge_message) $("journalStatus").textContent += ` Charges report: ${result.charge_message}`;
+    } catch (error) {
+      $("journalStatus").textContent = error.message;
+      toast("Journal sync failed: " + error.message, "error");
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  loadJournal().catch(error => { $("journalStatus").textContent = error.message; });
+  setInterval(() => loadJournal().catch(() => {}), 30000);
+
   fetch("/api/status").then(r => r.json()).then(applyStatus).catch(() => {});
   setInterval(() => {
     fetch("/api/status").then(r => r.json()).then(applyStatus).catch(() => {});

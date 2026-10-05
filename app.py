@@ -30,12 +30,14 @@ from app_config import DATA_DIR, SETTINGS_PATH, env_setting_is_set, load_setting
 import ai_sentiment
 import engine
 import option_signal
+import trading_journal
 from fyers_client import INDEX_SYMBOLS, FyersClient, extract_request_token, load_cached_access_token
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LAST_ANALYSIS_PATH = os.path.join(BASE_DIR, "last_analysis_state.json")
 PORT = int(os.environ.get("PORT", "5050"))
 SUPPORTED_INDEXES = frozenset(INDEX_SYMBOLS)
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30), "IST")
 
 # Editing a .py file never hot-reloads a running Python process - only a
 # full restart of `python app.py` picks up new code (unlike templates/
@@ -47,7 +49,7 @@ SUPPORTED_INDEXES = frozenset(INDEX_SYMBOLS)
 # any of them changed after this process started, we know for certain a
 # restart is needed and can say so plainly instead of guessing.
 SERVER_STARTED_AT = datetime.datetime.now()
-_WATCHED_PY_FILES = ["app.py", "app_config.py", "engine.py", "fyers_client.py", "option_signal.py", "ai_sentiment.py", "decision.py"]
+_WATCHED_PY_FILES = ["app.py", "app_config.py", "engine.py", "fyers_client.py", "trading_journal.py", "option_signal.py", "ai_sentiment.py", "decision.py"]
 
 
 def _code_last_modified():
@@ -241,9 +243,13 @@ def settings_configured(settings):
     if not settings.get("fyers_client_id") or not settings.get("fyers_secret_key"):
         return False
     provider = settings.get("ai_provider", "gemini")
+    if provider not in {"gemini", "claude", "openai"}:
+        return False
     if provider == "gemini" and not settings.get("gemini_api_key"):
         return False
     if provider == "claude" and not settings.get("anthropic_api_key"):
+        return False
+    if provider == "openai" and not settings.get("openai_api_key"):
         return False
     return True
 
@@ -253,6 +259,160 @@ def _make_log():
         print(message)
         socketio.emit("log", {"message": message})
     return log
+
+
+JOURNAL_SYNC_LOCK = threading.Lock()
+JOURNAL_SYNC_THREAD = None
+JOURNAL_SYNC_STOP = threading.Event()
+
+
+def _update_recommendation_outcomes(client, now_ist):
+    """Measure each strategy signal's later underlying move at fixed horizons."""
+    today = now_ist.date().isoformat()
+    pending = trading_journal.pending_recommendations(today)
+    if not pending:
+        return
+    grouped = {}
+    for row in pending:
+        try:
+            current_outcomes = json.loads(row.get("outcomes_json") or "{}")
+            if all(key in current_outcomes for key in ("15m", "30m", "60m", "close")):
+                continue
+            context = json.loads(row.get("universe_json") or "{}")
+            symbol = context.get("spot_symbol")
+            if symbol:
+                grouped.setdefault(symbol, []).append((row, context))
+        except (TypeError, ValueError):
+            continue
+
+    market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+    for symbol, rows in grouped.items():
+        try:
+            market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+            candles = client.get_intraday_history_for_symbol(symbol, market_open, now_ist, "1minute")
+        except Exception:
+            continue
+        points = []
+        for candle in candles:
+            try:
+                stamp = datetime.datetime.fromtimestamp(int(candle["date"]), datetime.timezone.utc).astimezone(
+                    trading_journal.IST)
+                points.append((stamp, float(candle["close"])))
+            except (KeyError, TypeError, ValueError, OverflowError, OSError):
+                continue
+        points.sort(key=lambda item: item[0])
+        if not points:
+            continue
+        for row, context in rows:
+            try:
+                created = datetime.datetime.fromisoformat(row["created_at"]).astimezone(trading_journal.IST)
+                outcomes = json.loads(row.get("outcomes_json") or "{}")
+                start_price = float(row.get("spot_price") or context.get("spot_price"))
+            except (TypeError, ValueError):
+                continue
+            if start_price <= 0:
+                continue
+            direction = str(row.get("direction") or "").upper()
+            targets = {"15m": created + datetime.timedelta(minutes=15),
+                       "30m": created + datetime.timedelta(minutes=30),
+                       "60m": created + datetime.timedelta(minutes=60),
+                       "close": market_close}
+            changed = False
+            for horizon, target in targets.items():
+                if outcomes.get(horizon):
+                    continue
+                if horizon == "close" and created >= market_close:
+                    if now_ist >= market_close + datetime.timedelta(minutes=5):
+                        outcomes[horizon] = {"status": "unavailable", "reason": "recommendation after market close"}
+                        changed = True
+                    continue
+                if target > market_close:
+                    if now_ist > market_close + datetime.timedelta(minutes=10):
+                        outcomes[horizon] = {"status": "unavailable", "reason": "horizon extends past market close"}
+                        changed = True
+                    continue
+                eligible = [price for stamp, price in points if stamp >= target]
+                if horizon == "close" and now_ist >= market_close + datetime.timedelta(minutes=5):
+                    eligible = [price for stamp, price in points if stamp.date() == now_ist.date() and stamp <= market_close]
+                    value = eligible[-1] if eligible else None
+                else:
+                    value = eligible[0] if eligible and target <= now_ist else None
+                if value is not None:
+                    move = value - start_price
+                    correct = move > 0 if direction == "CALL" else move < 0 if direction == "PUT" else None
+                    outcomes[horizon] = {"status": "ready", "target_at": target.isoformat(),
+                                         "spot": value, "move_points": move, "directional_correct": correct}
+                    changed = True
+                elif now_ist > target + datetime.timedelta(minutes=10):
+                    outcomes[horizon] = {"status": "unavailable", "reason": "no candle at target horizon"}
+                    changed = True
+            if changed:
+                trading_journal.update_recommendation_outcomes(row["id"], outcomes)
+
+
+def _journal_sync_loop():
+    last_charge_sync = {}
+    last_outcome_sync = 0.0
+    last_error_log = 0.0
+    last_history_attempt = 0.0
+    log = _make_log()
+    while not JOURNAL_SYNC_STOP.is_set():
+        with STATE_LOCK:
+            client = STATE.get("kite_client") if STATE.get("logged_in") else None
+        if client is not None:
+            now_ist = datetime.datetime.now(trading_journal.IST)
+            today = now_ist.date()
+            try:
+                cursor = trading_journal.get_meta("activity_history_through")
+                history_start = datetime.date.fromisoformat(cursor) + datetime.timedelta(days=1) if cursor else today - datetime.timedelta(days=29)
+                history_end = min(today - datetime.timedelta(days=1), history_start + datetime.timedelta(days=29))
+                if history_start <= history_end and time.monotonic() - last_history_attempt >= 30:
+                    last_history_attempt = time.monotonic()
+                    history = client.journal_history(history_start.isoformat(), history_end.isoformat())
+                    trading_journal.store_broker_records("order", history["orders"])
+                    trading_journal.store_broker_records("trade", history["trades"])
+                    trading_journal.store_charge_history(history_start.isoformat(), history_end.isoformat(), history["charges"])
+                    trading_journal.set_meta("activity_history_through", history_end.isoformat())
+            except Exception as exc:
+                if time.monotonic() - last_error_log > 60:
+                    log(f"[journal] historical account sync failed; retrying later: {exc!r}")
+                    last_error_log = time.monotonic()
+                last_history_attempt = time.monotonic()
+
+            try:
+                orders, trades = client.journal_snapshot()
+                trading_journal.store_broker_records("order", orders)
+                trading_journal.store_broker_records("trade", trades)
+            except Exception as exc:
+                if time.monotonic() - last_error_log > 60:
+                    log(f"[journal] FYERS order/trade sync failed: {exc!r}")
+                    last_error_log = time.monotonic()
+
+            day = now_ist.date().isoformat()
+            if time.monotonic() - last_charge_sync.get(day, 0) >= 300:
+                try:
+                    charges = client.charges_history(day)
+                    trading_journal.store_charge_report(day, charges)
+                    last_charge_sync[day] = time.monotonic()
+                except Exception as exc:
+                    if time.monotonic() - last_error_log > 60:
+                        log(f"[journal] FYERS charge report unavailable yet: {exc!r}")
+                        last_error_log = time.monotonic()
+
+            if time.monotonic() - last_outcome_sync >= 60:
+                _update_recommendation_outcomes(client, now_ist)
+                last_outcome_sync = time.monotonic()
+        JOURNAL_SYNC_STOP.wait(30)
+
+
+def _ensure_journal_sync():
+    global JOURNAL_SYNC_THREAD
+    with JOURNAL_SYNC_LOCK:
+        if JOURNAL_SYNC_THREAD is not None and JOURNAL_SYNC_THREAD.is_alive():
+            return
+        JOURNAL_SYNC_STOP.clear()
+        JOURNAL_SYNC_THREAD = threading.Thread(target=_journal_sync_loop, name="fyers-journal-sync", daemon=True)
+        JOURNAL_SYNC_THREAD.start()
 
 
 def _silent_log(message):
@@ -344,7 +504,7 @@ def index():
     ui_settings = dict(settings)
     if ui_settings.get("index") not in SUPPORTED_INDEXES:
         ui_settings["index"] = "NIFTY"
-    for key in ("fyers_client_id", "fyers_secret_key", "gemini_api_key", "anthropic_api_key"):
+    for key in ("fyers_client_id", "fyers_secret_key", "gemini_api_key", "anthropic_api_key", "openai_api_key"):
         ui_settings.pop(key, None)
     ui_settings["proxy"] = dict(settings.get("proxy", {}))
     ui_settings["proxy"].pop("user", None)
@@ -356,6 +516,7 @@ def index():
                                "fyers": env_setting_is_set("fyers_client_id") and env_setting_is_set("fyers_secret_key"),
                                "gemini": env_setting_is_set("gemini_api_key"),
                                "anthropic": env_setting_is_set("anthropic_api_key"),
+                               "openai": env_setting_is_set("openai_api_key"),
                            })
 
 
@@ -366,7 +527,7 @@ def get_settings():
     settings = load_settings()
     # Never send credentials back to the dashboard, even if an old local
     # settings.json still contains them.
-    for key in ("fyers_client_id", "fyers_secret_key", "gemini_api_key", "anthropic_api_key"):
+    for key in ("fyers_client_id", "fyers_secret_key", "gemini_api_key", "anthropic_api_key", "openai_api_key"):
         settings.pop(key, None)
     if isinstance(settings.get("proxy"), dict):
         settings["proxy"] = {k: v for k, v in settings["proxy"].items() if k not in {"user", "pass"}}
@@ -394,7 +555,13 @@ def update_settings():
                 return jsonify({"ok": False, "error": "Stop the engine before changing the options instrument."}), 400
         settings["index"] = requested_index
 
-    str_fields = ["ai_provider", "gemini_model", "claude_model", "time_exit",
+    if "ai_provider" in incoming:
+        requested_provider = str(incoming["ai_provider"]).strip().lower()
+        if requested_provider not in {"gemini", "claude", "openai"}:
+            return jsonify({"ok": False, "error": "Choose Gemini, Claude, or OpenAI (ChatGPT)."}), 400
+        settings["ai_provider"] = requested_provider
+
+    str_fields = ["gemini_model", "claude_model", "openai_model", "time_exit",
                   "custom_ai_note"]
     for field in str_fields:
         if field in incoming:
@@ -525,17 +692,28 @@ def spot_chart():
     settings = load_settings()
     try:
         spot_symbol, spot_token = _get_spot_instrument(kite_client, settings)
-        today = datetime.date.today()
-        market_open = datetime.datetime.combine(today, MARKET_OPEN_TIME)
-        now = datetime.datetime.now()
+        today = datetime.datetime.now(IST).date()
+        market_open = datetime.datetime.combine(today, MARKET_OPEN_TIME, tzinfo=IST)
+        now = datetime.datetime.now(IST)
         candles = []
         if now > market_open:
             raw = kite_client.get_intraday_history(spot_token, market_open, now, interval="5minute")
-            candles = [
-                {"time": int(c["date"].timestamp()), "open": c["open"], "high": c["high"],
-                 "low": c["low"], "close": c["close"]}
-                for c in raw
-            ]
+            for candle in raw:
+                candle_date = candle["date"]
+                if isinstance(candle_date, datetime.datetime):
+                    if candle_date.tzinfo is None:
+                        candle_date = candle_date.replace(tzinfo=IST)
+                    candle_time = int(candle_date.timestamp())
+                else:
+                    # FYERS returns candle dates as Unix epoch integers;
+                    # tolerate millisecond values from alternate wrappers.
+                    candle_time = int(candle_date)
+                    if abs(candle_time) > 10_000_000_000:
+                        candle_time //= 1000
+                candles.append({
+                    "time": candle_time, "open": candle["open"], "high": candle["high"],
+                    "low": candle["low"], "close": candle["close"],
+                })
         return jsonify({"ok": True, "spot_symbol": spot_symbol, "spot_token": spot_token, "candles": candles})
     except Exception as exc:  # noqa: BLE001 - a chart-backfill hiccup must never break the dashboard
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -576,7 +754,11 @@ def prompt_preview():
     """
     settings = load_settings()
     custom_note = (settings.get("custom_ai_note") or "").strip() or None
-    return jsonify({"prompt": ai_sentiment.build_prompt_preview(custom_note=custom_note)})
+    return jsonify({
+        "prompt": ai_sentiment.build_prompt_preview(
+            custom_note=custom_note, index=settings.get("index", "NIFTY")
+        )
+    })
 
 
 # --------------------------------------------------------------- control
@@ -600,6 +782,7 @@ def login():
         with STATE_LOCK:
             STATE["kite_client"] = client
             STATE["logged_in"] = True
+        _ensure_journal_sync()
         socketio.emit("login_status", {"status": "success", "source": "auto"})
         _resume_existing_position_if_any(_make_log())
         return jsonify({"ok": True, "cached": True})
@@ -647,6 +830,7 @@ def fyers_callback():
         with STATE_LOCK:
             STATE["kite_client"] = client
             STATE["logged_in"] = True
+        _ensure_journal_sync()
         socketio.emit("login_status", {"status": "success", "source": "auto"})
         _resume_existing_position_if_any(_make_log())
         return render_template("auth_callback.html", success=True,
@@ -689,6 +873,7 @@ def login_manual():
             with STATE_LOCK:
                 STATE["kite_client"] = client
                 STATE["logged_in"] = True
+            _ensure_journal_sync()
             socketio.emit("login_status", {"status": "success", "source": "manual"})
             _resume_existing_position_if_any(log)
         except Exception as exc:  # noqa: BLE001 - surface any failure to the UI, never crash the server
@@ -699,11 +884,12 @@ def login_manual():
     return jsonify({"ok": True, "message": "Verifying token..."})
 
 
-def _make_event_relays():
+def _make_event_relays(run_kind="execute"):
     """Shared by /api/execute, /api/manual_trade, and /api/analyze - all
     relay the exact same engine.py event/tick shapes to the browser over
     WebSocket."""
     def on_event(evt):
+        universe = None
         if evt.get("type") == "universe_ready":
             with STATE_LOCK:
                 STATE["last_universe_event"] = evt
@@ -711,7 +897,14 @@ def _make_event_relays():
         elif evt.get("type") == "decision":
             with STATE_LOCK:
                 STATE["last_decision_event"] = evt
+                universe = STATE.get("last_universe_event")
                 _save_last_analysis_to_disk()
+            try:
+                journal_event = dict(evt)
+                journal_event["run_kind"] = run_kind
+                trading_journal.record_recommendation(journal_event, universe, load_settings())
+            except Exception as exc:  # journal persistence must never interrupt engine safety logic
+                _make_log()(f"[journal] could not save recommendation: {exc!r}")
         socketio.emit("engine_event", evt)
 
     def on_tick(tick):
@@ -723,6 +916,42 @@ def _make_event_relays():
         })
 
     return on_event, on_tick
+
+
+def _sync_journal_once(client, sync_charges=True):
+    orders, trades = client.journal_snapshot()
+    trading_journal.store_broker_records("order", orders)
+    trading_journal.store_broker_records("trade", trades)
+    result = {"orders": len(orders), "trades": len(trades), "charges": False}
+    if sync_charges:
+        day = datetime.datetime.now(trading_journal.IST).date().isoformat()
+        try:
+            trading_journal.store_charge_report(day, client.charges_history(day))
+            result["charges"] = True
+        except Exception as exc:
+            result["charge_message"] = str(exc)
+    return result
+
+
+@app.route("/api/journal", methods=["GET"])
+def journal_data():
+    try:
+        limit = request.args.get("limit", 100, type=int)
+        return jsonify({"ok": True, **trading_journal.fetch_journal(limit)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"could not read journal: {exc}"}), 500
+
+
+@app.route("/api/journal/sync", methods=["POST"])
+def journal_sync_now():
+    with STATE_LOCK:
+        client = STATE.get("kite_client") if STATE.get("logged_in") else None
+    if client is None:
+        return jsonify({"ok": False, "error": "Log in to FYERS to sync account activity."}), 400
+    try:
+        return jsonify({"ok": True, **_sync_journal_once(client)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"FYERS order/trade sync failed: {exc}"}), 502
 
 
 def _resume_existing_position_if_any(log):
@@ -745,7 +974,7 @@ def _resume_existing_position_if_any(log):
         STATE["stop_event"] = stop_event
         kite_client = STATE["kite_client"]
 
-    on_event, on_tick = _make_event_relays()
+    on_event, on_tick = _make_event_relays("resume")
     _spawn_engine_thread(
         lambda: engine.resume_existing_position(
             stop_event=stop_event, settings_path=SETTINGS_PATH, log=log,
@@ -788,7 +1017,7 @@ def execute():
         kite_client = STATE["kite_client"]
 
     log = _make_log()
-    on_event, on_tick = _make_event_relays()
+    on_event, on_tick = _make_event_relays("execute")
 
     _spawn_engine_thread(
         lambda: engine.run(
@@ -825,7 +1054,7 @@ def manual_trade():
         kite_client = STATE["kite_client"]
 
     log = _make_log()
-    on_event, on_tick = _make_event_relays()
+    on_event, on_tick = _make_event_relays("manual_entry")
 
     _spawn_engine_thread(
         lambda: engine.manual_run(
@@ -855,7 +1084,7 @@ def analyze():
         kite_client = STATE["kite_client"]
 
     log = _make_log()
-    on_event, on_tick = _make_event_relays()
+    on_event, on_tick = _make_event_relays("analyze_only")
 
     _spawn_engine_thread(
         lambda: engine.analyze_only(
@@ -922,6 +1151,7 @@ def _try_restore_session():
         with STATE_LOCK:
             STATE["kite_client"] = client
             STATE["logged_in"] = True
+        _ensure_journal_sync()
         print("[app] restored today's FYERS session from token.json - no need to log in again")
         # This silent-restore path counts as "logged in" exactly like
         # /api/login and /api/login/manual - a position left open from
@@ -944,4 +1174,4 @@ if __name__ == "__main__":
     else:
         print(f"[app] starting dashboard bound to {host}:{PORT} - "
               f"open http://<this-machine's-public-IP>:{PORT} from your browser")
-    socketio.run(app, host=host, port=PORT)
+    socketio.run(app, host=host, port=PORT, allow_unsafe_werkzeug=True)

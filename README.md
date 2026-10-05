@@ -3,6 +3,10 @@
 A single-user tool for semi-automated intraday BUYING of NIFTY weekly
 options via FYERS API v3, with a password-protected web dashboard.
 
+For a code-oriented handoff covering architecture, data flow, AI providers,
+trading safety, deployment, diagnostics, and current known issues, see
+[AI_CODING_GUIDE.md](AI_CODING_GUIDE.md).
+
 ## ⚠️ Disclaimer
 
 This is **not a guaranteed-profit system**. It is a tool that automates order
@@ -83,16 +87,20 @@ Render service's Environment settings; never commit real values:
 | `FYERS_CLIENT_ID` | FYERS App ID |
 | `FYERS_SECRET_KEY` | FYERS secret |
 | `FYERS_REDIRECT_URI` | `https://<your-service>.onrender.com/auth/fyers/callback` |
-| `AI_PROVIDER` | `gemini` or `claude` |
+| `AI_PROVIDER` | `gemini`, `claude`, or `openai` |
 | `GEMINI_API_KEY` | Gemini key, when using Gemini |
 | `ANTHROPIC_API_KEY` | Anthropic key, when using Claude |
-| `GEMINI_MODEL` / `CLAUDE_MODEL` | Optional model overrides |
+| `OPENAI_API_KEY` | OpenAI API key, when using OpenAI (ChatGPT) |
+| `GEMINI_MODEL` / `CLAUDE_MODEL` / `OPENAI_MODEL` | Optional model overrides |
 | `PROXY_USERNAME` / `PROXY_PASSWORD` | Optional proxy credentials |
 
 Register the exact `FYERS_REDIRECT_URI` in the FYERS app settings. After
 Render gives you the service hostname, set that variable and redeploy. The
 Login button opens FYERS in your browser; FYERS returns to the hosted callback.
 For local development use `http://127.0.0.1:5050/auth/fyers/callback` instead.
+To use OpenAI, set `AI_PROVIDER=openai` and provide `OPENAI_API_KEY`; this app
+uses the OpenAI API, so a ChatGPT website login is not an API key. The optional
+`OPENAI_MODEL` defaults to `gpt-6-astra`.
 `DATA_DIR` can point to a mounted persistent disk for saved strategy settings
 and the daily token cache; without persistent storage, those local files may
 be lost on a Render restart (the environment secrets remain configured).

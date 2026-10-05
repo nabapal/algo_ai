@@ -37,6 +37,7 @@ INDIA_VIX_TRADINGSYMBOL = "INDIAVIX-INDEX"  # NSE's volatility index - one for t
 
 MARKET_OPEN_TIME = datetime.time(9, 15)  # NSE equity/F&O session open (IST) - used to bound
                                           # today's opening-range candles (see get_orb_bias).
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30), "IST")
 
 
 def _emit(on_event, payload):
@@ -78,11 +79,15 @@ def _setup_universe_and_ticker(kite_client, settings, log, on_event, on_tick):
     universe = build_option_universe(kite_client, settings["index"], log)
     _emit(on_event, {
         "type": "universe_ready",
+        "index": settings["index"],
         "spot_symbol": universe["spot_symbol"],
         "spot_token": universe["spot_token"],
+        "spot_price": universe["initial_quote"].get("last_price"),
         "atm_strike": universe["atm_strike"],
         "nearest_expiry": str(universe["nearest_expiry"]),
         "strike_interval": universe["strike_interval"],
+        "atm_call_symbol": universe["instruments_by_strike"][universe["atm_strike"]]["CE"]["tradingsymbol"],
+        "atm_put_symbol": universe["instruments_by_strike"][universe["atm_strike"]]["PE"]["tradingsymbol"],
     })
 
     all_tokens = [universe["spot_token"]]
@@ -206,7 +211,36 @@ def gather_strike_oi(kite_client, universe, log):
     fallback_quotes = {}
     if missing_symbols:
         log(f"[engine] {len(missing_symbols)} option(s) missing OI from ticker, one-time REST quote() fallback")
-        fallback_quotes = kite_client.get_quote(missing_symbols)
+        try:
+            fallback_quotes = kite_client.get_quote(missing_symbols, include_oi_source=True) or {}
+        except Exception as exc:  # noqa: BLE001 - OI fallback failure must be visible, not hide analysis
+            log(f"[engine] OI REST quote fallback FAILED for {len(missing_symbols)} option(s): {exc!r}")
+            fallback_quotes = {}
+
+        recovered = []
+        unresolved = []
+        source_counts = {"quote": 0, "option_chain_snapshot": 0}
+        for symbol in missing_symbols:
+            quote = fallback_quotes.get(symbol) or {}
+            oi = quote.get("oi")
+            if oi in (None, 0):
+                unresolved.append(symbol)
+                continue
+            recovered.append(symbol)
+            source = quote.get("oi_source")
+            if source in source_counts:
+                source_counts[source] += 1
+            else:
+                # Clients that do not provide provenance still returned OI.
+                source_counts["quote"] += 1
+
+        log(
+            f"[engine] OI REST quote fallback result: recovered {len(recovered)}/{len(missing_symbols)}; "
+            f"FYERS quote OI={source_counts['quote']}, option-chain snapshot OI="
+            f"{source_counts['option_chain_snapshot']}, still missing={len(unresolved)}"
+        )
+        if unresolved:
+            log(f"[engine] OI still unavailable after fallback: {', '.join(unresolved)}")
 
     strike_oi_data = {s: {"CE": 0, "PE": 0} for s in target_strikes}
     strike_volume_data = {s: {"CE": 0, "PE": 0} for s in target_strikes}
@@ -445,10 +479,10 @@ def get_orb_bias(kite_client, universe, current_price, settings, log):
     so no futures proxy is needed here.
     """
     orb_minutes = settings.get("orb_minutes", 15)
-    today = datetime.date.today()
-    market_open = datetime.datetime.combine(today, MARKET_OPEN_TIME)
+    now = datetime.datetime.now(IST)
+    today = now.date()
+    market_open = datetime.datetime.combine(today, MARKET_OPEN_TIME, tzinfo=IST)
     orb_end = market_open + datetime.timedelta(minutes=orb_minutes)
-    now = datetime.datetime.now()
 
     if now < orb_end:
         log(f"[engine] ORB check: today's opening range ({orb_minutes}min) hasn't finished forming yet "
@@ -460,10 +494,33 @@ def get_orb_bias(kite_client, universe, current_price, settings, log):
         log("[engine] ORB check: no opening-range candles available, falling back to NEUTRAL")
         return {"orb_bias": "NEUTRAL", "orb_high": None, "orb_low": None, "orb_minutes": orb_minutes}
 
-    orb_high = max(c["high"] for c in candles)
-    orb_low = min(c["low"] for c in candles)
+    # FYERS history returns epoch timestamps (UTC) and the history request
+    # bounds are date-only. Keep only the requested opening interval after
+    # converting every candle timestamp to IST; otherwise the entire day's
+    # candles can leak into the opening range.
+    opening_candles = []
+    for candle in candles:
+        try:
+            timestamp = int(candle["date"])
+            if timestamp > 10_000_000_000:  # tolerate milliseconds from wrappers
+                timestamp //= 1000
+            candle_time = datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc).astimezone(IST)
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            continue
+        if market_open <= candle_time < orb_end:
+            opening_candles.append((candle_time, candle))
+    if not opening_candles:
+        log(f"[engine] ORB check: FYERS returned {len(candles)} candles, but none fell in the "
+            f"IST opening range {market_open.time()}-{orb_end.time()}; falling back to NEUTRAL")
+        return {"orb_bias": "NEUTRAL", "orb_high": None, "orb_low": None, "orb_minutes": orb_minutes}
+
+    orb_high = max(c["high"] for _, c in opening_candles)
+    orb_low = min(c["low"] for _, c in opening_candles)
     orb_bias = option_signal.compute_orb_bias(current_price, orb_high, orb_low)
-    log(f"[engine] ORB check: opening range ({orb_minutes}min)={orb_low:.2f}-{orb_high:.2f} "
+    first_candle = min(stamp for stamp, _ in opening_candles)
+    last_candle = max(stamp for stamp, _ in opening_candles)
+    log(f"[engine] ORB check: IST candles {first_candle:%H:%M}-{last_candle:%H:%M} "
+        f"(opening range {orb_minutes}min)={orb_low:.2f}-{orb_high:.2f} "
         f"current={current_price} -> orb_bias={orb_bias}")
     return {"orb_bias": orb_bias, "orb_high": orb_high, "orb_low": orb_low, "orb_minutes": orb_minutes}
 
@@ -680,11 +737,15 @@ def resume_existing_position(stop_event=None, settings_path="settings.json", log
         universe = build_option_universe(kite_client, settings["index"], log)
         _emit(on_event, {
             "type": "universe_ready",
+            "index": settings["index"],
             "spot_symbol": universe["spot_symbol"],
             "spot_token": universe["spot_token"],
+            "spot_price": universe["initial_quote"].get("last_price"),
             "atm_strike": universe["atm_strike"],
             "nearest_expiry": str(universe["nearest_expiry"]),
             "strike_interval": universe["strike_interval"],
+            "atm_call_symbol": universe["instruments_by_strike"][universe["atm_strike"]]["CE"]["tradingsymbol"],
+            "atm_put_symbol": universe["instruments_by_strike"][universe["atm_strike"]]["PE"]["tradingsymbol"],
         })
         all_tokens.append(universe["spot_token"])
         if universe.get("futures_token") is not None:
@@ -1223,6 +1284,8 @@ def _run_analysis(kite_client, universe, settings, log, on_event):
 
     _emit(on_event, {
         "type": "decision",
+        "index": settings.get("index"),
+        "spot_price": spot_price,
         "technical_bias": technical_bias,
         "oi_bias": oi_result["oi_bias"],
         "pcr": oi_result["pcr"],

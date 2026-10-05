@@ -286,7 +286,7 @@ class FyersClient:
         self._token_by_symbol[item["symbol"]] = item["instrument_token"]
         return item
 
-    def get_quote(self, exchange_tradingsymbols):
+    def get_quote(self, exchange_tradingsymbols, include_oi_source=False):
         symbols = [self._format_symbol(s) for s in exchange_tradingsymbols]
         resp = self.fyers.quotes({"symbols": ",".join(symbols)})
         if resp.get("s") != "ok":
@@ -299,11 +299,17 @@ class FyersClient:
                 continue
             key = self._legacy_key(sym)
             chain_snapshot = self._option_snapshot.get(sym, {})
-            out[key] = {"last_price": v.get("lp", 0), "oi": v.get("oi", 0), "volume": v.get("volume", 0),
+            quote_oi = v.get("oi", 0)
+            oi_source = "quote" if quote_oi not in (None, 0) else (
+                "option_chain_snapshot" if chain_snapshot.get("oi") is not None else "missing")
+            out[key] = {"last_price": v.get("lp", 0), "oi": quote_oi, "volume": v.get("volume", 0),
                         "average_price": v.get("atp", 0), "ohlc": {"open": v.get("open_price"), "close": v.get("prev_close_price")}}
             # FYERS quotes omit OI; the option-chain snapshot carries OI and volume.
             if out[key].get("oi") in (None, 0) and chain_snapshot.get("oi") is not None:
                 out[key]["oi"] = chain_snapshot["oi"]
+            if include_oi_source:
+                out[key]["oi_source"] = oi_source
+                out[key]["quote_oi"] = quote_oi
             if out[key].get("volume") in (None, 0) and chain_snapshot.get("volume") is not None:
                 out[key]["volume"] = chain_snapshot["volume"]
         return out
@@ -352,7 +358,22 @@ class FyersClient:
         resolution = "1" if interval in ("minute", "1minute") else "5" if "5" in interval else "15"
         return self._history(token, start, end, resolution)
 
-    def start_ticker(self, instrument_tokens, token_meta=None, on_tick=None):
+    def get_intraday_history_for_symbol(self, symbol, start, end, interval="1minute"):
+        resolution = "1" if interval in ("minute", "1minute") else "5" if "5" in interval else "15"
+        api_symbol = symbol if str(symbol).startswith("NSE:") else self._format_symbol(f"NSE:{symbol}")
+        response = self.fyers.history(data={
+            "symbol": api_symbol, "resolution": resolution, "date_format": "1",
+            "range_from": start.strftime("%Y-%m-%d"), "range_to": end.strftime("%Y-%m-%d"),
+            "cont_flag": "1",
+        })
+        if response.get("s") == "no_data":
+            return []
+        if response.get("s") != "ok":
+            raise RuntimeError(f"FYERS history failed for {api_symbol}: {response}")
+        return [{"date": candle[0], "open": candle[1], "high": candle[2], "low": candle[3],
+                 "close": candle[4], "volume": candle[5]} for candle in response.get("candles", [])]
+
+    def start_ticker(self, instrument_tokens, token_meta=None, on_tick=None, on_raw_message=None):
         # Load lazily because FYERS's socket module imports pkg_resources.
         try:
             from fyers_apiv3.FyersWebsocket import data_ws
@@ -372,25 +393,36 @@ class FyersClient:
         def on_message(message):
             rows = message if isinstance(message, list) else [message]
             normalized = []
+            raw_rows = []
             with self._lock:
                 for row in rows:
                     if not isinstance(row, dict):
                         continue
                     symbol = row.get("symbol") or row.get("n")
                     token = str(row.get("fyToken") or self._token_by_symbol.get(symbol, symbol))
+                    oi_fields = [key for key in row if str(key).lower() in {"oi", "open_interest", "openinterest"}]
                     tick = {"instrument_token": token, "last_price": row.get("ltp", row.get("lp", 0)),
-                            "oi": row.get("oi"), "volume_traded": row.get("vol_traded_today", row.get("volume", 0)),
+                            "oi": row.get("oi"), "oi_field_present": bool(oi_fields),
+                            "oi_field_names": oi_fields, "oi_raw_value": row.get("oi"),
+                            "volume_traded": row.get("vol_traded_today", row.get("volume", 0)),
                             "average_price": row.get("avg_trade_price", row.get("atp", 0)),
                             "ohlc": {"open": row.get("open_price", 0), "close": row.get("prev_close_price", 0)}}
                     self._tick_store[token] = tick
                     self._last_tick_time = time.time()
                     normalized.append(tick)
+                    raw_rows.append(dict(row))
             for tick in normalized:
                 if on_tick:
                     try:
                         on_tick(tick)
                     except Exception as exc:
                         self.log(f"[fyers] tick callback error: {exc!r}")
+            if on_raw_message:
+                for row in raw_rows:
+                    try:
+                        on_raw_message(row)
+                    except Exception as exc:
+                        self.log(f"[fyers] raw tick callback error: {exc!r}")
         def on_open():
             self.ticker.subscribe(symbols=symbols, data_type="SymbolUpdate")
             self._ticker_connected.set()
@@ -449,6 +481,75 @@ class FyersClient:
                         "quantity": p.get("netQty", 0), "average_price": p.get("netAvg", p.get("buyAvg", 0)),
                         "last_price": p.get("ltp"), "pnl": p.get("pl", 0), "symbol": sym})
         return {"net": out}
+
+    def journal_snapshot(self):
+        """Fetch the account-wide order and trade books for reconciliation."""
+        orders = self.fyers.orderbook()
+        trades = self.fyers.tradebook()
+        for label, response in (("orderbook", orders), ("tradebook", trades)):
+            if not isinstance(response, dict) or response.get("s") != "ok":
+                raise RuntimeError(f"FYERS {label} failed: {response}")
+        order_rows = self._journal_rows(orders, ("orderBook", "orderbook", "orders"))
+        trade_rows = self._journal_rows(trades, ("tradeBook", "tradebook", "trades"))
+        return order_rows, trade_rows
+
+    def charges_history(self, from_date, to_date=None):
+        """Fetch FYERS's reported charges for the account and date range."""
+        to_date = to_date or from_date
+        response = requests.get(
+            "https://api-t1.fyers.in/api/v3/charges-history",
+            headers={"Authorization": f"{self.client_id}:{self.access_token}"},
+            params={"from_date": from_date, "to_date": to_date, "page_size": 100, "page_no": 1},
+            timeout=15,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict) or result.get("s") != "ok":
+            raise RuntimeError(f"FYERS charges history failed: {result}")
+        return result
+
+    @staticmethod
+    def _journal_rows(response, row_keys):
+        """Find a report's row list across FYERS response envelope variants."""
+        wanted = {key.lower() for key in row_keys}
+        def visit(value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key.lower() in wanted and isinstance(child, list):
+                        return child
+                for child in value.values():
+                    found = visit(child)
+                    if found is not None:
+                        return found
+            return None
+        return visit(response) or []
+
+    def journal_history(self, from_date, to_date):
+        """Backfill account order/trade history for dates missed while offline."""
+        headers = {"Authorization": f"{self.client_id}:{self.access_token}"}
+        results = {}
+        for name, keys in (("order-history", ("orderHistory", "orderBook", "orders")),
+                           ("trade-history", ("tradeHistory", "tradeBook", "trades"))):
+            rows = []
+            page = 1
+            while page <= 50:
+                response = requests.get(
+                    f"https://api-t1.fyers.in/api/v3/{name}", headers=headers,
+                    params={"from_date": from_date, "to_date": to_date,
+                            "page_size": 100, "page_no": page}, timeout=20,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict) or payload.get("s") != "ok":
+                    raise RuntimeError(f"FYERS {name} failed: {payload}")
+                batch = self._journal_rows(payload, keys)
+                rows.extend(batch)
+                if len(batch) < 100:
+                    break
+                page += 1
+            results["orders" if name == "order-history" else "trades"] = rows
+        results["charges"] = self.charges_history(from_date, to_date)
+        return results
 
     def is_nse_fo_market_open(self):
         """Fail closed unless FYERS reports NSE derivatives as currently OPEN."""
