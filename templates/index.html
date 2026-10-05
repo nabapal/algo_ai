@@ -57,7 +57,8 @@
         <span>Gemini key: {{ 'configured' if credential_status.gemini else 'missing' }}</span>
         <span>Anthropic key: {{ 'configured' if credential_status.anthropic else 'missing' }}</span>
         <span>OpenAI API key: {{ 'configured' if credential_status.openai else 'missing' }}</span>
-        <small>Set FYERS_CLIENT_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URI, the API key for your selected AI provider,
+        <span>Tavily search key: {{ 'configured' if credential_status.tavily else 'missing' }}</span>
+        <small>Set FYERS_CLIENT_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URI, the API key for your selected AI provider and TAVILY_API_KEY for Gemini web search,
           and optionally AI_PROVIDER in the server environment. Secrets are never shown here.</small>
       </div>
 

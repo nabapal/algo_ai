@@ -504,7 +504,7 @@ def index():
     ui_settings = dict(settings)
     if ui_settings.get("index") not in SUPPORTED_INDEXES:
         ui_settings["index"] = "NIFTY"
-    for key in ("fyers_client_id", "fyers_secret_key", "gemini_api_key", "anthropic_api_key", "openai_api_key"):
+    for key in ("fyers_client_id", "fyers_secret_key", "gemini_api_key", "anthropic_api_key", "openai_api_key", "tavily_api_key"):
         ui_settings.pop(key, None)
     ui_settings["proxy"] = dict(settings.get("proxy", {}))
     ui_settings["proxy"].pop("user", None)
@@ -517,6 +517,7 @@ def index():
                                "gemini": env_setting_is_set("gemini_api_key"),
                                "anthropic": env_setting_is_set("anthropic_api_key"),
                                "openai": env_setting_is_set("openai_api_key"),
+                               "tavily": env_setting_is_set("tavily_api_key"),
                            })
 
 
@@ -527,7 +528,7 @@ def get_settings():
     settings = load_settings()
     # Never send credentials back to the dashboard, even if an old local
     # settings.json still contains them.
-    for key in ("fyers_client_id", "fyers_secret_key", "gemini_api_key", "anthropic_api_key", "openai_api_key"):
+    for key in ("fyers_client_id", "fyers_secret_key", "gemini_api_key", "anthropic_api_key", "openai_api_key", "tavily_api_key"):
         settings.pop(key, None)
     if isinstance(settings.get("proxy"), dict):
         settings["proxy"] = {k: v for k, v in settings["proxy"].items() if k not in {"user", "pass"}}

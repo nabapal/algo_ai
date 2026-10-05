@@ -89,6 +89,7 @@ Render service's Environment settings; never commit real values:
 | `FYERS_REDIRECT_URI` | `https://<your-service>.onrender.com/auth/fyers/callback` |
 | `AI_PROVIDER` | `gemini`, `claude`, or `openai` |
 | `GEMINI_API_KEY` | Gemini key, when using Gemini |
+| `TAVILY_API_KEY` | Tavily Search API key used to fetch current web results for Gemini |
 | `ANTHROPIC_API_KEY` | Anthropic key, when using Claude |
 | `OPENAI_API_KEY` | OpenAI API key, when using OpenAI (ChatGPT) |
 | `GEMINI_MODEL` / `CLAUDE_MODEL` / `OPENAI_MODEL` | Optional model overrides |
@@ -101,6 +102,10 @@ For local development use `http://127.0.0.1:5050/auth/fyers/callback` instead.
 To use OpenAI, set `AI_PROVIDER=openai` and provide `OPENAI_API_KEY`; this app
 uses the OpenAI API, so a ChatGPT website login is not an API key. The optional
 `OPENAI_MODEL` defaults to `gpt-6-astra`.
+For Gemini, set `AI_PROVIDER=gemini`, `GEMINI_API_KEY`, and `TAVILY_API_KEY`.
+The app performs one basic Tavily search request and gives its compact results
+to Gemini; Gemini's own Google Search grounding is disabled. Tavily failures
+are logged and Gemini continues without live news context.
 `DATA_DIR` can point to a mounted persistent disk for saved strategy settings
 and the daily token cache; without persistent storage, those local files may
 be lost on a Render restart (the environment secrets remain configured).

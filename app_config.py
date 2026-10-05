@@ -22,6 +22,7 @@ ENV_SETTING_KEYS = {
     "gemini_api_key": "GEMINI_API_KEY",
     "anthropic_api_key": "ANTHROPIC_API_KEY",
     "openai_api_key": "OPENAI_API_KEY",
+    "tavily_api_key": "TAVILY_API_KEY",
     "ai_provider": "AI_PROVIDER",
     "gemini_model": "GEMINI_MODEL",
     "claude_model": "CLAUDE_MODEL",
@@ -29,6 +30,7 @@ ENV_SETTING_KEYS = {
 }
 SECRET_SETTING_KEYS = {
     "fyers_client_id", "fyers_secret_key", "gemini_api_key", "anthropic_api_key", "openai_api_key",
+    "tavily_api_key",
 }
 _SETTINGS_LOCK = threading.RLock()
 

@@ -89,7 +89,7 @@ def record_recommendation(event, universe=None, strategy=None):
     strategy = dict(strategy or {})
     for key in (
         "fyers_client_id", "fyers_secret_key", "fyers_redirect_uri",
-        "gemini_api_key", "anthropic_api_key", "openai_api_key",
+        "gemini_api_key", "anthropic_api_key", "openai_api_key", "tavily_api_key",
     ):
         strategy.pop(key, None)
     if isinstance(strategy.get("proxy"), dict):

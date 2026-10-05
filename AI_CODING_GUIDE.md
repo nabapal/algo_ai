@@ -124,7 +124,7 @@ BANK (BANKNIFTY), NIFTY Financial Services (FINNIFTY), and NIFTY Midcap Select
 
 | `AI_PROVIDER` | Credential | Model setting | Transport |
 |---|---|---|---|
-| `gemini` | `GEMINI_API_KEY` | `GEMINI_MODEL` | Gemini `generateContent`, Google Search grounding enabled. A grounded HTTP 429 triggers one retry of the same prompt without Google Search. |
+| `gemini` | `GEMINI_API_KEY` + `TAVILY_API_KEY` | `GEMINI_MODEL` | One basic Tavily news search restricted to the previous day supplies compact web results; its query date and Gemini prompt date use Asia/Kolkata. Gemini `generateContent` interprets them; Google Search grounding is disabled. |
 | `claude` | `ANTHROPIC_API_KEY` | `CLAUDE_MODEL` | Anthropic Messages API with web search. |
 | `openai` | `OPENAI_API_KEY` | `OPENAI_MODEL` | OpenAI Responses API with `web_search` and strict structured JSON output. |
 
@@ -136,10 +136,11 @@ required. The `.env.example` default model is `gpt-6-astra`, configurable via
 
 If a provider fails, times out, returns invalid JSON, or is not configured,
 the code returns the safe `NEUTRAL` result so the engine can finish analysis.
-Logs must never include API keys. Gemini's fallback retry only handles a
-grounded 429; other errors such as 503 become a safe neutral result.
+Logs must never include API keys. Gemini uses Tavily search results as
+untrusted reference data; a Tavily failure does not prevent the Gemini call.
+If Gemini fails, the safe `NEUTRAL` result is returned.
 
-### Gemini grounding diagnostic
+### Gemini API diagnostic
 
 The current diagnostic script supports:
 
@@ -150,20 +151,10 @@ python test_gemini_api.py --grounded --application-prompt
 python test_gemini_api.py --model gemini-flash-lite-latest --grounded --application-prompt
 ```
 
-The default health check is intentionally short and non-grounded. Use
-`--grounded` to test Search grounding; `--application-prompt` exercises the
-project's research prompt. Grounded requests are made once (no retry) so the
-original Google API error code/message is visible. They use quota/billing and
-should not be looped as a health poll.
-
-Observed during troubleshooting on 2026-10-05: grounded generation using
-`gemini-flash-lite-latest` returned HTTP 429 `RESOURCE_EXHAUSTED` with Google's
-message that the current quota was exceeded and to check plan/billing. A
-non-grounded request with the same model and app prompt returned HTTP 200.
-This establishes a quota/billing issue on the grounded request path, but the
-429 message did not identify the specific quota meter. Check the matching
-Google AI Studio project usage/limits; do not infer exact remaining quota from
-the app's generic 429 log.
+The diagnostic script directly tests Gemini, independently of Tavily. The
+`--grounded` option is only for diagnosing Google's own Search grounding; the
+application no longer enables that tool. For the application pipeline, inspect
+the `[ai_sentiment] Tavily` and `Gemini request HTTP` log entries.
 
 ## Configuration and persistence
 
@@ -183,6 +174,7 @@ settings responses/saved settings.
 | `FYERS_CLIENT_ID`, `FYERS_SECRET_KEY`, `FYERS_REDIRECT_URI` | FYERS OAuth application credentials and exact callback URL. Register the callback URL in FYERS. |
 | `AI_PROVIDER` | Optional fixed provider (`gemini`, `claude`, `openai`). If set, the UI provider dropdown is disabled. If absent, provider can be saved in `settings.json`. |
 | `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | Provider-specific API keys. Configure the key matching the selected provider. |
+| `TAVILY_API_KEY` | Tavily key used for Gemini's web search context; one Basic Search request per Gemini sentiment call, filtered with `topic=news` and `days=1`. |
 | `GEMINI_MODEL`, `CLAUDE_MODEL`, `OPENAI_MODEL` | Optional model overrides. |
 | `DATA_DIR` | Directory for settings, FYERS token cache and trading journal. Use persistent storage on cloud hosts. |
 | `SETTINGS_PATH` | Optional override for strategy settings file. |
@@ -280,12 +272,11 @@ notice based on source mtimes. A browser refresh does not reload Python code.
 - **Option contracts missing:** Run `diagnose_fyers_oi.py` with the existing
   token. It reports option-chain, WebSocket and quote OI details; raw tokens
   must not be copied into public logs.
-- **Gemini grounded 429:** Run `test_gemini_api.py --grounded
-  --application-prompt` once. Preserve its `error.code`, `error.status`, and
-  `error.message`; check AI Studio project usage and billing. Plain successful
-  generation does not prove Search grounding quota is available.
-- **AI safe NEUTRAL:** Read `[ai_sentiment]` logs for provider/model, grounding
-  status, fallback status, response or error. A safe default means no valid
+- **Tavily search failure:** Check that `TAVILY_API_KEY` is configured and read
+  the `[ai_sentiment] Tavily` status/error log. Gemini still runs without live
+  search context if Tavily is unavailable.
+- **AI safe NEUTRAL:** Read `[ai_sentiment]` logs for provider/model, Tavily
+  result count, fallback status, response or error. A safe default means no valid
   AI response; it is not a directional AI signal.
 - **Chart 500:** Check server traceback. FYERS history dates are Unix epochs;
   avoid `.timestamp()` on an integer.
