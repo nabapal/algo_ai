@@ -267,9 +267,11 @@ and `static`, then restarts through `run.sh`. It defaults to the project's
 Oracle address and key path; use `-SshKey`, `-Remote`, and `-RemoteDir` to
 override them. It does not transfer `.env`, `settings.json`, `token.json`, logs,
 SQLite databases, tests, or documents. The upload overlays those selected
-paths without deleting unrelated remote files. Since `run.sh` installs
-requirements at startup, each deployment also performs that install. The app
-log is timestamped under the remote `logs/` directory.
+paths without deleting unrelated remote files. It requires an existing
+`$RemoteDir/.venv/bin/activate`; if missing, the remote script aborts before
+replacing app files. It activates that venv before `run.sh`, so dependencies
+are installed and the app starts inside it. The app log is timestamped under
+the remote `logs/` directory.
 
 The FYERS adapter resolves SENSEX through `BSE:SENSEX-INDEX` and the BSE F&O
 symbol master. It keeps FYERS's `BSE` API exchange while translating to the

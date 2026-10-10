@@ -51,6 +51,10 @@ set -euo pipefail
 stage="$1"
 app_dir="$2"
 mkdir -p "$app_dir/logs"
+if [ ! -f "$app_dir/.venv/bin/activate" ]; then
+    echo "Required Python virtual environment is missing: $app_dir/.venv/bin/activate" >&2
+    exit 1
+fi
 for file in app.py app_config.py ai_sentiment.py engine.py option_signal.py decision.py fyers_client.py trading_journal.py requirements.txt settings.example.json run.sh; do
     test -f "$stage/$file"
 done
@@ -82,7 +86,7 @@ if [ -n "$pids" ]; then
 fi
 
 log_file="$app_dir/logs/app-$(date +%Y%m%d-%H%M%S).log"
-nohup bash -c "cd '$app_dir' && ./run.sh" > "$log_file" 2>&1 < /dev/null &
+nohup bash -c "cd '$app_dir' && source .venv/bin/activate && ./run.sh" > "$log_file" 2>&1 < /dev/null &
 app_pid=$!
 rm -rf -- "$stage"
 printf 'Deployment uploaded and restart started. PID=%s\nLog=%s\n' "$app_pid" "$log_file"

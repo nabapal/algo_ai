@@ -131,10 +131,13 @@ the application modules, `requirements.txt`, `settings.example.json`, `run.sh`,
 `templates`, and `static`; it does not upload `.env`, `settings.json`, `token.json`,
 logs, SQLite databases, tests, or generated documents. It overlays the selected
 files on the VM without deleting other files, then stops the app's Python
-process and restarts it through the existing `run.sh`. That launcher installs
-the requirements before starting the app. The new run writes to a timestamped
-file under `/home/opc/algo_ai/logs/`. The script requires Windows OpenSSH
-(`ssh` and `scp`) and does not publish to GitHub.
+process and restarts it through the existing `run.sh` after activating
+`/home/opc/algo_ai/.venv`. That virtual environment must already exist on the
+VM; if its activation script is missing, the deploy aborts before replacing
+the app files. The launcher installs requirements into the activated venv.
+The new run writes to a timestamped file under `/home/opc/algo_ai/logs/`.
+The script requires Windows OpenSSH (`ssh` and `scp`) and does not publish to
+GitHub.
 
 **If you ever edit any of the `.py` files** (or pull an update) while the
 server is already running: refreshing the browser page alone is **not**
