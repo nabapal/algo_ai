@@ -259,7 +259,7 @@ def _append_tavily_results(prompt, results):
     )
 
 
-def _call_gemini(settings, market_context=None, custom_note=None, timeout=45, log=print, index="NIFTY"):
+def _call_gemini(settings, market_context=None, custom_note=None, timeout=45, log=print, index="NIFTY", audit=None):
     api_key = settings["gemini_api_key"]
     model = settings["gemini_model"]
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -267,9 +267,17 @@ def _call_gemini(settings, market_context=None, custom_note=None, timeout=45, lo
     prompt = _fixed_prompt(market_context, custom_note, index=index)
     try:
         search_results = _search_tavily(settings, index=index, timeout=min(timeout, 25), log=log)
+        if audit is not None:
+            audit["tavily_status"] = "success" if search_results else (
+                "empty" if settings.get("tavily_api_key") else "not_configured")
+            audit["tavily_result_count"] = len(search_results)
+            audit["tavily_results"] = search_results
     except Exception as exc:  # noqa: BLE001 - search outage should not block Gemini analysis
         log(f"[ai_sentiment] Tavily search failed ({exc!r}); Gemini will continue without live search")
         search_results = []
+        if audit is not None:
+            audit["tavily_status"] = "failed"
+            audit["tavily_result_count"] = 0
     prompt = _append_tavily_results(prompt, search_results)
     body = {"contents": [{"parts": [{"text": prompt}]}]}
     log(f"[ai_sentiment] Gemini request started (model={model}, Tavily results={len(search_results)}, Google Search grounding=disabled)")
@@ -283,6 +291,8 @@ def _call_gemini(settings, market_context=None, custom_note=None, timeout=45, lo
             error_message = ""
         log(f"[ai_sentiment] Gemini API error: {error_message or resp.reason}")
     resp.raise_for_status()
+    if audit is not None:
+        audit["request_status"] = "success"
     data = resp.json()
     parts = data["candidates"][0]["content"]["parts"]
     text = "".join(p.get("text", "") for p in parts)
@@ -381,33 +391,45 @@ def get_ai_sentiment(settings, market_context=None, log=print):
     provider = settings.get("ai_provider", "gemini")
     index = settings.get("index", "NIFTY")
     custom_note = (settings.get("custom_ai_note") or "").strip() or None
+    model_key = {"gemini": "gemini_model", "claude": "claude_model", "openai": "openai_model"}.get(provider)
+    audit = {"provider": provider, "model": settings.get(model_key) if model_key else None,
+             "request_status": "not_started", "grounding_status": "unknown"}
     try:
         if provider == "gemini":
             raw_text = _call_gemini(
-                settings, market_context=market_context, custom_note=custom_note, log=log, index=index
+                settings, market_context=market_context, custom_note=custom_note, log=log, index=index, audit=audit
             )
+            audit["grounding_status"] = {"google_search": "disabled", "tavily": audit.get("tavily_status", "unknown")}
         elif provider == "claude":
             raw_text = _call_claude(settings, market_context=market_context, custom_note=custom_note, index=index)
+            audit["request_status"] = "success"
+            audit["grounding_status"] = {"provider_web_search": "enabled"}
         elif provider == "openai":
             raw_text = _call_openai(
                 settings, market_context=market_context, custom_note=custom_note, log=log, index=index
             )
+            audit["request_status"] = "success"
+            audit["grounding_status"] = {"provider_web_search": "enabled"}
         else:
             log(f"[ai_sentiment] unknown ai_provider {provider!r}, using safe default")
-            return dict(_SAFE_DEFAULT)
+            return {**_SAFE_DEFAULT, **audit, "request_status": "not_configured",
+                    "grounding_status": "not_available"}
 
         log(f"[ai_sentiment] raw response ({len(raw_text)} chars): {raw_text[:2000]!r}")
         parsed = _parse_sentiment_json(raw_text)
         if parsed is None:
             log("[ai_sentiment] response was not valid sentiment JSON; using safe default")
-            return dict(_SAFE_DEFAULT)
+            return {**_SAFE_DEFAULT, **audit, "request_status": "invalid_response"}
 
         log(f"[ai_sentiment] provider={provider} sentiment={parsed['sentiment']} reason={parsed['reason']!r}")
-        return parsed
+        return {**parsed, **audit}
 
     except Exception as exc:  # noqa: BLE001 - intentionally broad: never crash the run
         log(f"[ai_sentiment] call failed ({exc!r}), using safe default")
-        return dict(_SAFE_DEFAULT)
+        audit["request_status"] = "failed"
+        if audit.get("grounding_status") == "unknown":
+            audit["grounding_status"] = {"provider_web_search": "not_confirmed"}
+        return {**_SAFE_DEFAULT, **audit}
 
 
 def build_prompt_preview(custom_note=None, index="NIFTY"):

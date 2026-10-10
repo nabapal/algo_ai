@@ -42,6 +42,20 @@
 
 <main class="container">
 
+  <section class="market-strip card" aria-label="Market overview">
+    <div class="market-primary">
+      <div class="market-instrument"><span id="marketInstrument">{{ settings.index }} Options</span><span id="marketLiveStatus" class="live-indicator offline"><i></i> OFFLINE</span></div>
+      <div class="market-price-line"><strong id="ltpValue" class="big-number">—</strong><span id="marketChange" class="market-change neutral">—</span></div>
+    </div>
+    <div class="market-meta">
+      <div><span>Server</span><strong>{{ restart.server_started_at if restart is defined and restart else '—' }}</strong></div>
+      <div><span>Expiry</span><strong id="marketExpiry">—</strong></div>
+      <div><span>ATM strike</span><strong id="marketAtm">—</strong></div>
+      <div><span>Strike step</span><strong id="marketStrikeStep">—</strong></div>
+      <div><span>India VIX</span><strong id="marketVix">—</strong></div>
+    </div>
+  </section>
+
   <!-- ===================== SETTINGS ===================== -->
   <section id="settingsPanel" class="card settings-card {{ '' if not configured else 'collapsed' }}">
     <div class="card-header">
@@ -69,6 +83,7 @@
           <option value="BANKNIFTY" {{ 'selected' if settings.index == 'BANKNIFTY' }}>BANK NIFTY</option>
           <option value="FINNIFTY" {{ 'selected' if settings.index == 'FINNIFTY' }}>FINNIFTY</option>
           <option value="MIDCPNIFTY" {{ 'selected' if settings.index == 'MIDCPNIFTY' }}>MIDCPNIFTY</option>
+          <option value="SENSEX" {{ 'selected' if settings.index == 'SENSEX' }}>SENSEX (BSE)</option>
         </select>
         <small>Applies to the next analysis or execution. Stop the engine before changing it.</small>
       </div>
@@ -107,6 +122,21 @@
           <span>Target</span>
         </div>
         <input type="number" id="target_profit" placeholder="Target profit (₹)" value="{{ settings.target_profit }}">
+      </div>
+
+      <div class="field toggle-field">
+        <div class="toggle-row">
+          <label class="switch">
+            <input type="checkbox" id="profit_lock_enabled" {{ 'checked' if settings.profit_lock_enabled }}>
+            <span class="slider"></span>
+          </label>
+          <span>Profit Lock (combined P&amp;L)</span>
+        </div>
+        <label for="profit_lock_activation">Activate after profit (₹)</label>
+        <input type="number" id="profit_lock_activation" min="0" step="100" value="{{ settings.get('profit_lock_activation', 2000) }}">
+        <label for="profit_lock_amount">Exit if profit falls to (₹)</label>
+        <input type="number" id="profit_lock_amount" min="0" step="100" value="{{ settings.get('profit_lock_amount', 1000) }}">
+        <small>Once activated, exits all open legs when their combined P&amp;L reaches this floor. Requires pnl_mode=COMBINED.</small>
       </div>
 
       <div class="field toggle-field">
@@ -313,7 +343,19 @@
           <h2 id="chartTitle">Live Chart</h2>
           <span id="chartSubtitle" class="muted small"></span>
         </div>
+        <div class="chart-legend"><span><i class="legend-price"></i> Price</span><span><i class="legend-vwap"></i> VWAP</span><span><i class="legend-orb"></i> ORB High/Low</span><span><i class="legend-resistance"></i> Resistance</span><span><i class="legend-support"></i> Support</span><span class="muted">Volume is not returned by the current chart API</span></div>
         <div id="chart" class="chart-container"></div>
+      </div>
+
+      <div class="card oi-summary-card">
+        <div class="card-header"><div><h2>Option Chain / OI Snapshot</h2><span class="muted small">ATM ±5 summary from the latest analysis</span></div></div>
+        <div class="oi-summary-grid">
+          <div class="oi-stat"><span>Whole-window PCR</span><strong id="pcrValue">—</strong></div>
+          <div class="oi-stat"><span>Proximity-weighted PCR</span><strong id="weightedPcrValue">—</strong></div>
+          <div class="oi-change-card call"><span>ATM CALL OI change</span><strong id="atmCeOiChange">—</strong></div>
+          <div class="oi-change-card put"><span>ATM PUT OI change</span><strong id="atmPeOiChange">—</strong></div>
+        </div>
+        <p class="muted small oi-data-note">Strike-by-strike OI quantities are not included in the current dashboard API response.</p>
       </div>
 
       <div class="card signals-card">
@@ -358,7 +400,7 @@
         <div id="rangeTooTightNote" class="decision-reason muted small"></div>
         <div class="final-direction-row">
           <span class="muted">Final Direction <span id="decisionRuleInfo" class="info-icon" title="">ⓘ</span></span>
-          <span id="finalDirection" class="value direction-badge large">—</span>
+          <span id="signalFinalDirection" class="value direction-badge large">—</span>
         </div>
       </div>
 
@@ -369,10 +411,6 @@
       <div class="card top-stats-card">
         <div class="top-stats-row">
           <div class="top-stat">
-            <div class="label">LTP <span id="feedStatus" class="feed-status" style="display:none;"></span></div>
-            <div id="ltpValue" class="big-number">—</div>
-          </div>
-          <div class="top-stat">
             <div class="label">P&amp;L</div>
             <div id="pnlValue" class="big-number neutral">—</div>
           </div>
@@ -380,7 +418,7 @@
       </div>
 
       <div class="card probability-card">
-        <div class="label">Probability of Move</div>
+        <div class="card-header"><h2>Probability of Move</h2><span id="feedStatus" class="feed-status" style="display:none;"></span></div>
         <div id="probBarEmpty" class="prob-bar-empty">Not analyzed yet - click Execute</div>
         <div id="probBar" class="prob-bar" style="display:none;">
           <div id="probUpBar" class="prob-bar-up"></div>
@@ -389,6 +427,14 @@
         <div class="prob-bar-legend">
           <span class="prob-legend-up">▲ Upside</span>
           <span class="prob-legend-down">Downside ▼</span>
+        </div>
+
+        <div class="prob-decision-row"><span>Final Decision</span><span id="finalDirection" class="value direction-badge large">—</span></div>
+        <div class="expected-move-stats">
+          <div><span>VIX expected move</span><strong id="vixExpectedMove">—</strong></div>
+          <div><span>Historical 15-day move</span><strong id="historicalMove">—</strong></div>
+          <div class="blended"><span>Blended expected move</span><strong id="blendedMove">—</strong></div>
+          <div><span>Move consumed</span><strong id="moveConsumed">—</strong></div>
         </div>
 
         <div class="range-meter-block">
@@ -449,15 +495,38 @@
     </div>
   </section>
 
+  <!-- ===================== LOG ===================== -->
+  <section class="card log-card">
+    <details>
+      <summary>Technical log</summary>
+      <div id="logPanel" class="log-panel"></div>
+    </details>
+  </section>
+
   <section class="card journal-card">
     <div class="card-header">
       <div>
         <h2>Trading Journal</h2>
-        <span id="journalStatus" class="muted small">Account activity syncs from FYERS while logged in.</span>
+        <span id="journalStatus" class="muted small">Tracks application recommendations separately from your FYERS account.</span>
       </div>
-      <button id="journalSyncBtn" class="btn btn-secondary" type="button">Sync FYERS activity</button>
     </div>
     <div class="journal-summary" id="journalSummary">No journal data yet.</div>
+    <div class="journal-section">
+      <div class="card-header">
+        <div><h3>Historical signal performance</h3>
+          <p class="muted small">Signal outcomes are not FYERS realized P&amp;L. Small samples are marked insufficient; no model is trained.</p>
+        </div>
+        <label class="small">Breakdown
+          <select id="journalPerformanceDimension">
+            <option value="by_horizon">Horizon</option>
+            <option value="by_decision">Decision</option>
+            <option value="by_probability_bucket">Probability bucket</option>
+            <option value="by_market_regime">Market regime</option>
+          </select>
+        </label>
+      </div>
+      <div id="journalPerformance" class="muted small">Loading performance summary…</div>
+    </div>
     <div class="journal-section">
       <h3>Application recommendations</h3>
       <p class="muted small">Underlying movement is measured 15, 30, and 60 minutes after each signal and at market close. This is signal tracking, separate from account P&amp;L.</p>
@@ -468,29 +537,6 @@
         </table>
       </div>
     </div>
-    <div class="journal-section">
-      <h3>FYERS account activity</h3>
-      <p class="muted small">Includes orders and executions returned by FYERS, including manually placed or exited orders when present in the broker feeds.</p>
-      <div class="journal-table-wrap">
-        <table class="journal-table">
-          <thead><tr><th>Time</th><th>Source</th><th>Kind</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Status</th></tr></thead>
-          <tbody id="journalActivity"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-    <div class="journal-section">
-      <h3>FYERS charges reports</h3>
-      <p class="muted small">Charge report responses are stored as received. A report may remain unavailable or provisional until FYERS publishes the day's charges.</p>
-      <div id="journalCharges" class="journal-charges muted small">No charge reports synced yet.</div>
-    </div>
-  </section>
-
-  <!-- ===================== LOG ===================== -->
-  <section class="card log-card">
-    <details>
-      <summary>Technical log</summary>
-      <div id="logPanel" class="log-panel"></div>
-    </details>
   </section>
 
   <footer class="disclaimer-footer">

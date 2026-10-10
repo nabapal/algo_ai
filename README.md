@@ -1,7 +1,8 @@
-# NIFTY Weekly Options - Semi-Automated Intraday BUYING Engine
+# Index Options Engine - Semi-Automated Intraday BUYING
 
-A single-user tool for semi-automated intraday BUYING of NIFTY weekly
-options via FYERS API v3, with a password-protected web dashboard.
+A single-user tool for semi-automated intraday BUYING of index options via
+FYERS API v3, with a password-protected web dashboard. The selector supports
+NIFTY, BANKNIFTY, FINNIFTY and MIDCPNIFTY on NSE, plus SENSEX on BSE.
 
 For a code-oriented handoff covering architecture, data flow, AI providers,
 trading safety, deployment, diagnostics, and current known issues, see
@@ -21,7 +22,7 @@ never risk money you can't afford to lose.
 
 ## What this is
 
-- BUYING only (NIFTY weekly options) - never selling to open a position.
+- BUYING only (selected-index options) - never selling to open a position.
 - One AI/analysis call per Execute run, at the very start. The monitoring
   loop after that never calls AI or does network "analysis" again - only
   arithmetic on live tick data already sitting in memory.
@@ -51,6 +52,11 @@ Set a long unique `APP_PASSWORD` and a random `APP_SESSION_SECRET` (at least
 prints one). Add your FYERS and AI API values to `.env`. Strategy preferences
 are stored separately in `settings.json`; the app initializes safe defaults
 from `settings.example.json` if that file does not exist.
+
+Choose the underlying index in Settings. SENSEX uses FYERS's BSE index and
+BSE F&O contracts; NIFTY, BANKNIFTY, FINNIFTY, and MIDCPNIFTY use NSE. Expiry,
+strike interval, and lot size come from FYERS at runtime. India VIX remains a
+shared volatility input for all selected indices and is not SENSEX-specific.
 
 Then start the app as usual:
 
@@ -109,6 +115,26 @@ are logged and Gemini continues without live news context.
 `DATA_DIR` can point to a mounted persistent disk for saved strategy settings
 and the daily token cache; without persistent storage, those local files may
 be lost on a Render restart (the environment secrets remain configured).
+
+### Oracle Cloud VM deployment from Windows
+
+From the project folder, run:
+
+```powershell
+.\deploy_oracle.ps1
+```
+
+The script defaults to `C:\Users\<your-user>\Downloads\ssh-key-2026-10-03.key`,
+`opc@130.210.30.223`, and `/home/opc/algo_ai`. Override these with
+`-SshKey`, `-Remote`, and `-RemoteDir` when needed. It stages and uploads only
+the application modules, `requirements.txt`, `settings.example.json`, `run.sh`,
+`templates`, and `static`; it does not upload `.env`, `settings.json`, `token.json`,
+logs, SQLite databases, tests, or generated documents. It overlays the selected
+files on the VM without deleting other files, then stops the app's Python
+process and restarts it through the existing `run.sh`. That launcher installs
+the requirements before starting the app. The new run writes to a timestamped
+file under `/home/opc/algo_ai/logs/`. The script requires Windows OpenSSH
+(`ssh` and `scp`) and does not publish to GitHub.
 
 **If you ever edit any of the `.py` files** (or pull an update) while the
 server is already running: refreshing the browser page alone is **not**
@@ -172,17 +198,18 @@ trigger the same immediate square-off as the web UI's Stop button.
 ## Running the tests
 
 ```bash
-pytest test_option_signal.py test_decision.py -v
+pytest test_option_signal.py test_decision.py test_fyers_sensex.py test_profit_lock.py test_recommendation_training.py -v
 ```
 
-These test the two pure-Python modules (OI/VWAP bias math, gap math, the
-decision truth table) with fake data - no FYERS connection, AI call, or
-browser needed, and they're safe to run any time.
+These tests cover pure signal and decision logic, SENSEX symbol/exchange
+mapping, combined profit-lock behavior, and recommendation outcomes. FYERS
+integration tests use mocked responses; this command does not place orders.
 
 ## How it all fits together
 
 1. `engine.run()` loads `settings.json`, logs in to FYERS (or reuses an
-   already-logged-in session), fetches the live NIFTY option chain, and
+   already-logged-in session), fetches the live option chain for the selected
+   index, and
    figures out the ATM strike and ATM +/- 5 strikes to track.
 2. It starts FYERS market-data WebSocket, streaming ticks (LTP + OI) for those strikes plus
    the underlying index.
@@ -389,10 +416,11 @@ browser needed, and they're safe to run any time.
 7. If not NO_TRADE, it places BUY order(s) for `settings.lots` x the
    *live* lot_size FYERS reports (never hardcoded - NSE revises lot sizes
    over time), then enters a monitoring loop.
-8. The loop checks, about once a second: manual STOP, SL/target (per
-   `pnl_mode`), your optional time-exit, and the always-on
+8. The loop checks, about once a second: manual STOP, SL/target and profit
+   lock (per `pnl_mode`, with profit lock supported only in `COMBINED` mode),
+   your optional time-exit, and the always-on
    `force_exit_time` safety net - whichever hits first squares off the
-   position(s) with a market SELL order. SL/target/time-exit/pnl_mode are
+   position(s) with a market SELL order. SL/target/profit-lock/time-exit/pnl_mode are
    **re-read from `settings.json` on every one of these ticks** (see
    `engine._read_live_exit_settings`), so changing them from the dashboard's
    Settings panel and clicking Save takes effect immediately on an
@@ -486,8 +514,22 @@ browser needed, and they're safe to run any time.
 - **pnl_mode**: `"COMBINED"` (the default) sums P&L across all open legs and
   checks SL/target against the total. Any other value (e.g. `"PER_LEG"`) is
   treated as per-leg mode: each leg's own P&L is checked independently, and
-  only that leg is squared off when it triggers. Not exposed in the web UI
-  (edit `settings.json` directly if you want per-leg mode).
+  only that leg is squared off when it triggers. The profit-lock feature is
+  intentionally available only in `COMBINED` mode; in per-leg mode it logs a
+  warning and does not independently apply the lock to each leg. Not exposed
+  in the web UI (edit `settings.json` directly if you want per-leg mode).
+- **Profit lock**: disabled by default. In `COMBINED` mode, the lock activates
+  when the sum of open-leg P&L reaches `profit_lock_activation` (default
+  ₹2,000), then exits all open legs if combined P&L falls to or below
+  `profit_lock_amount` (default ₹1,000). Activation remains latched while the
+  feature stays enabled; disabling it while the trade is open disarms it.
+  Both thresholds are live-reloaded with SL/target settings. The activation
+  latch is stored in the journal database and matched against reconciled FYERS
+  positions so it survives an app restart while that position is still open.
+  These P&L values use the app's mark-to-market `(LTP - entry LTP) × quantity`
+  calculation and do not subtract brokerage, taxes, or exit slippage; the
+  locked amount is a trigger threshold, not a guaranteed realized profit.
+  This is an app-side monitor, not a broker-hosted stop order.
 - **BOTH direction** (straddle) buys a full `lots` quantity on *both* the
   ATM CE and ATM PE - it does not split one `lots` quantity across the two
   legs.
@@ -542,7 +584,7 @@ browser needed, and they're safe to run any time.
 | `settings.json` | All user-editable config - both the web UI and console read/write this same file. |
 | `fyers_client.py` | FYERS v3 login, symbol lookup, market-data socket, quotes/history, and dry-run-gated orders. |
 | `option_signal.py` | Pure functions: OI-bias (PCR), VWAP-bias, combined technical bias, gap/range flag. |
-| `ai_sentiment.py` | One fixed-prompt AI call (Gemini or Claude), safe NEUTRAL fallback on any failure. |
+| `ai_sentiment.py` | One fixed-prompt AI call (Gemini, Claude, or OpenAI), safe NEUTRAL fallback on any failure. |
 | `decision.py` | Standalone final-direction truth table (CALL/PUT/BOTH/NO_TRADE). |
 | `engine.py` | Wires everything together: one Execute run, then the safety-first monitoring loop. |
 | `run_headless.py` | Console entry point + manual STOP listener (no browser needed). |
@@ -550,4 +592,6 @@ browser needed, and they're safe to run any time.
 | `templates/index.html`, `static/style.css`, `static/dashboard.js` | The single-page web dashboard. |
 | `static/socket.io.min.js`, `static/lightweight-charts.standalone.production.js` | Bundled front-end libraries (see note above). |
 | `run.bat` / `run.sh` | Double-click launchers (Windows / Mac-Linux). |
+| `deploy_oracle.ps1` | Uploads the explicitly listed application files to an Oracle VM and restarts the app. |
 | `test_option_signal.py`, `test_decision.py` | Unit tests for the pure-Python logic. |
+| `test_fyers_sensex.py` | Mocked tests for SENSEX BSE symbol, contract metadata, symbol formatting, and BSE F&O market status. |

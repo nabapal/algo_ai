@@ -15,7 +15,9 @@ Safety rules enforced here (see README for the full list):
 """
 
 import datetime
+import hashlib
 import json
+import math
 import threading
 import time
 
@@ -30,6 +32,7 @@ INDEX_SPOT_TRADINGSYMBOL = {
     "BANKNIFTY": "NIFTYBANK-INDEX",
     "FINNIFTY": "FINNIFTY-INDEX",
     "MIDCPNIFTY": "MIDCPNIFTY-INDEX",
+    "SENSEX": "SENSEX-INDEX",
 }
 
 INDIA_VIX_TRADINGSYMBOL = "INDIAVIX-INDEX"  # NSE's volatility index - one for the whole market,
@@ -54,6 +57,10 @@ def _emit(on_event, payload):
 
 def _resolve_spot_tradingsymbol(index):
     return INDEX_SPOT_TRADINGSYMBOL.get(index, f"{index} 50")
+
+
+def _option_quote_key(instrument):
+    return f"{instrument.get('legacy_exchange', 'NFO')}:{instrument['tradingsymbol']}"
 
 
 def _parse_hhmm(hhmm_str):
@@ -83,6 +90,8 @@ def _setup_universe_and_ticker(kite_client, settings, log, on_event, on_tick):
         "spot_symbol": universe["spot_symbol"],
         "spot_token": universe["spot_token"],
         "spot_price": universe["initial_quote"].get("last_price"),
+        "spot_quote_source_timestamp": universe["initial_quote"].get("source_timestamp"),
+        "spot_quote_received_at_utc": universe["initial_quote"].get("received_at_utc"),
         "atm_strike": universe["atm_strike"],
         "nearest_expiry": str(universe["nearest_expiry"]),
         "strike_interval": universe["strike_interval"],
@@ -125,8 +134,9 @@ def build_option_universe(kite_client, index, log):
     spot_symbol = _resolve_spot_tradingsymbol(index)
     spot_instrument = kite_client.get_index_instrument(spot_symbol, exchange="NSE")
     spot_token = spot_instrument["instrument_token"]
+    spot_quote_key = spot_instrument.get("symbol", f"NSE:{spot_symbol}")
 
-    initial_quote = kite_client.get_quote([f"NSE:{spot_symbol}"])[f"NSE:{spot_symbol}"]
+    initial_quote = kite_client.get_quote([spot_quote_key])[spot_quote_key]
     spot_price = initial_quote["last_price"]
     log(f"[engine] {spot_symbol} spot price = {spot_price}")
 
@@ -159,15 +169,19 @@ def build_option_universe(kite_client, index, log):
         futures_instrument = kite_client.get_nfo_futures_instrument(index)
         futures_token = futures_instrument["instrument_token"]
         futures_tradingsymbol = futures_instrument["tradingsymbol"]
-        log(f"[engine] VWAP proxy: nearest NIFTY futures = {futures_tradingsymbol} "
+        futures_quote_key = f"{futures_instrument.get('legacy_exchange', 'NFO')}:{futures_tradingsymbol}"
+        log(f"[engine] VWAP proxy: nearest {index} futures = {futures_tradingsymbol} "
             f"(expiry {futures_instrument['expiry']})")
     except Exception as exc:  # noqa: BLE001
         log(f"[engine] futures lookup for VWAP failed ({exc!r}), VWAP will be unavailable")
         futures_token = None
         futures_tradingsymbol = None
+        futures_quote_key = None
 
     return {
         "spot_symbol": spot_symbol,
+        "spot_quote_key": spot_quote_key,
+        "api_exchange": spot_instrument.get("api_exchange", "NSE"),
         "spot_instrument": spot_instrument,
         "spot_token": spot_token,
         "initial_quote": initial_quote,
@@ -178,6 +192,7 @@ def build_option_universe(kite_client, index, log):
         "instruments_by_strike": instruments_by_strike,
         "futures_token": futures_token,
         "futures_tradingsymbol": futures_tradingsymbol,
+        "futures_quote_key": futures_quote_key,
     }
 
 
@@ -205,9 +220,11 @@ def gather_strike_oi(kite_client, universe, log):
     _wait_for_ticks(kite_client, tokens, timeout=5)
     ticks = kite_client.get_all_ticks()
 
-    missing_symbols = [
-        f"NFO:{token_meta[t][2]}" for t in tokens if t not in ticks or ticks[t].get("oi") is None
-    ]
+    missing_symbols = []
+    for token in tokens:
+        if token not in ticks or ticks[token].get("oi") is None:
+            strike, opt_type, _ = token_meta[token]
+            missing_symbols.append(_option_quote_key(instruments_by_strike[strike][opt_type]))
     fallback_quotes = {}
     if missing_symbols:
         log(f"[engine] {len(missing_symbols)} option(s) missing OI from ticker, one-time REST quote() fallback")
@@ -251,7 +268,7 @@ def gather_strike_oi(kite_client, universe, log):
             strike_oi_data[strike][opt_type] = tick["oi"]
             strike_volume_data[strike][opt_type] = tick.get("volume_traded", 0) or 0
         else:
-            q = fallback_quotes.get(f"NFO:{tradingsymbol}")
+            q = fallback_quotes.get(_option_quote_key(instruments_by_strike[strike][opt_type]))
             strike_oi_data[strike][opt_type] = (q or {}).get("oi", 0) or 0
             strike_volume_data[strike][opt_type] = (q or {}).get("volume", 0) or 0
 
@@ -367,17 +384,17 @@ def get_atm_premiums(kite_client, universe, log):
 
     missing = []
     if ce_premium is None:
-        missing.append(f"NFO:{ce_instr['tradingsymbol']}")
+        missing.append(_option_quote_key(ce_instr))
     if pe_premium is None:
-        missing.append(f"NFO:{pe_instr['tradingsymbol']}")
+        missing.append(_option_quote_key(pe_instr))
     if missing:
         log(f"[engine] {len(missing)} ATM option(s) missing live tick for premium check, "
             f"one-time REST quote() fallback")
         q = kite_client.get_quote(missing)
         if ce_premium is None:
-            ce_premium = q[f"NFO:{ce_instr['tradingsymbol']}"]["last_price"]
+            ce_premium = q[_option_quote_key(ce_instr)]["last_price"]
         if pe_premium is None:
-            pe_premium = q[f"NFO:{pe_instr['tradingsymbol']}"]["last_price"]
+            pe_premium = q[_option_quote_key(pe_instr)]["last_price"]
 
     return {
         "ce_premium": ce_premium, "pe_premium": pe_premium,
@@ -412,17 +429,21 @@ def get_vwap(kite_client, universe, log):
 
     tick = kite_client.get_tick(futures_token)
     if tick and tick.get("average_price"):
+        universe["vwap_source_input"] = {"source": "futures_ticker", "tick": tick}
         return tick["average_price"]
 
     futures_symbol = universe.get("futures_tradingsymbol")
     if futures_symbol:
-        q = kite_client.get_quote([f"NFO:{futures_symbol}"]).get(f"NFO:{futures_symbol}")
+        futures_key = universe.get("futures_quote_key", f"NFO:{futures_symbol}")
+        q = kite_client.get_quote([futures_key]).get(futures_key)
         if q and q.get("average_price"):
+            universe["vwap_source_input"] = {"source": "futures_quote", "quote": q}
             return q["average_price"]
 
     log("[engine] futures average_price unavailable from tick/quote, falling back to minute-candle VWAP")
     today = datetime.date.today()
     candles = kite_client.get_intraday_history(futures_token, today, today, interval="minute")
+    universe["vwap_source_input"] = {"source": "futures_intraday_candles", "candles": candles}
     formatted = [{"high": c["high"], "low": c["low"], "close": c["close"], "volume": c["volume"]} for c in candles]
     return option_signal.compute_vwap_from_candles(formatted)
 
@@ -522,7 +543,9 @@ def get_orb_bias(kite_client, universe, current_price, settings, log):
     log(f"[engine] ORB check: IST candles {first_candle:%H:%M}-{last_candle:%H:%M} "
         f"(opening range {orb_minutes}min)={orb_low:.2f}-{orb_high:.2f} "
         f"current={current_price} -> orb_bias={orb_bias}")
-    return {"orb_bias": orb_bias, "orb_high": orb_high, "orb_low": orb_low, "orb_minutes": orb_minutes}
+    return {"orb_bias": orb_bias, "orb_high": orb_high, "orb_low": orb_low, "orb_minutes": orb_minutes,
+            "opening_candles": [{"timestamp_ist": stamp.isoformat(), **candle}
+                                for stamp, candle in opening_candles]}
 
 
 def get_cpr_width_ratio(daily_candles, avg_range, log):
@@ -567,8 +590,9 @@ def _square_off_one(kite_client, p, log, reason=""):
     Returns True if a SELL was actually placed, False if skipped (nothing
     left to square off).
     """
+    position_exchange = p.get("exchange", "NFO")
     actual_qty = kite_client.get_actual_position_qty(
-        p["tradingsymbol"], exchange="NFO", product="MIS", expected_qty=p["qty"]
+        p["tradingsymbol"], exchange=position_exchange, product="MIS", expected_qty=p["qty"]
     )
     if not actual_qty or actual_qty <= 0:
         log(f"[engine] {p['tradingsymbol']}: FYERS shows no long quantity left - looks like this "
@@ -579,7 +603,7 @@ def _square_off_one(kite_client, p, log, reason=""):
         log(f"[engine] {p['tradingsymbol']}: expected qty {p['qty']} but FYERS shows {actual_qty} "
             f"actually still open (partially exited manually?) - squaring off the real remaining "
             f"{actual_qty} instead")
-    kite_client.place_market_order(p["tradingsymbol"], "NFO", FyersClient.SELL, actual_qty)
+    kite_client.place_market_order(p["tradingsymbol"], position_exchange, FyersClient.SELL, actual_qty)
     log(f"[engine] squared off {p['tradingsymbol']} qty={actual_qty} entry={p['entry_price']} "
         f"exit_ltp={p.get('ltp')} pnl={p.get('pnl')} reason={reason}")
     return True
@@ -596,7 +620,7 @@ def enter_positions(kite_client, universe, direction, settings, log):
     # those snapshots into a new entry; verify the actual NSE F&O status at
     # the broker immediately before any order (also covers Manual Entry).
     try:
-        market_open = kite_client.is_nse_fo_market_open()
+        market_open = kite_client.is_fo_market_open(universe.get("api_exchange", "NSE"))
     except Exception as exc:
         log(f"[engine] cannot verify NSE F&O market status; blocking entry ({exc!r})")
         raise RuntimeError("Entry blocked because FYERS market status could not be verified") from exc
@@ -615,24 +639,30 @@ def enter_positions(kite_client, universe, direction, settings, log):
         lot_size = instr["lot_size"]  # LIVE from FYERS symbol master, never hardcoded
         qty = settings["lots"] * lot_size
 
-        kite_client.place_market_order(
-            instr["tradingsymbol"], "NFO", FyersClient.BUY, qty
+        option_exchange = instr.get("legacy_exchange", "NFO")
+        order_result = kite_client.place_market_order(
+            instr["tradingsymbol"], option_exchange, FyersClient.BUY, qty
         )
 
         tick = kite_client.get_tick(instr["instrument_token"])
         entry_price = tick["last_price"] if tick and tick.get("last_price") is not None else None
         if entry_price is None:
-            q = kite_client.get_quote([f"NFO:{instr['tradingsymbol']}"])
-            entry_price = q[f"NFO:{instr['tradingsymbol']}"]["last_price"]
+            quote_key = _option_quote_key(instr)
+            q = kite_client.get_quote([quote_key])
+            entry_price = q[quote_key]["last_price"]
 
         positions.append({
             "token": instr["instrument_token"],
             "tradingsymbol": instr["tradingsymbol"],
+            "exchange": option_exchange,
             "type": opt_type,
             "qty": qty,
             "entry_price": entry_price,
             "ltp": entry_price,
             "pnl": 0.0,
+            "entry_order_id": order_result.get("order_id") if isinstance(order_result, dict) else None,
+            "entry_order_accepted": True,
+            "dry_run": bool(order_result.get("dry_run")) if isinstance(order_result, dict) else None,
         })
         log(f"[engine] entered BUY {instr['tradingsymbol']} qty={qty} entry_price={entry_price}")
 
@@ -673,7 +703,7 @@ def reconcile_open_positions(kite_client, settings, log):
 
     positions = []
     for p in net:
-        if p.get("exchange") != "NFO" or p.get("product") != "MIS":
+        if p.get("exchange") != instr.get("legacy_exchange", "NFO") or p.get("product") != "MIS":
             continue
         qty = p.get("quantity", 0)
         if qty <= 0:
@@ -688,6 +718,7 @@ def reconcile_open_positions(kite_client, settings, log):
         positions.append({
             "token": instr["instrument_token"],
             "tradingsymbol": symbol,
+            "exchange": instr.get("legacy_exchange", "NFO"),
             "type": opt_type,
             "qty": qty,
             "entry_price": entry_price,
@@ -697,6 +728,7 @@ def reconcile_open_positions(kite_client, settings, log):
         log(f"[engine] RECONCILED existing FYERS position: {symbol} qty={qty} "
             f"avg_price={entry_price} - recovered after restart, resuming monitoring")
 
+    _prune_profit_lock_positions(positions)
     return positions
 
 
@@ -777,7 +809,9 @@ def resume_existing_position(stop_event=None, settings_path="settings.json", log
 def _positions_snapshot(positions):
     return [
         {"tradingsymbol": p["tradingsymbol"], "type": p["type"], "qty": p["qty"],
-         "entry_price": p["entry_price"], "ltp": p.get("ltp"), "pnl": p.get("pnl")}
+         "entry_price": p["entry_price"], "ltp": p.get("ltp"), "pnl": p.get("pnl"),
+         "entry_order_id": p.get("entry_order_id"),
+         "entry_order_accepted": p.get("entry_order_accepted"), "dry_run": p.get("dry_run")}
         for p in positions
     ]
 
@@ -787,12 +821,67 @@ STALE_TICK_RE_WARN_SECONDS = 30  # don't spam the log/UI - re-warn at most this 
 
 
 _EXIT_SETTING_KEYS = ("sl_enabled", "max_loss", "target_enabled", "target_profit",
+                      "profit_lock_enabled", "profit_lock_activation", "profit_lock_amount",
                       "time_exit_enabled", "time_exit", "pnl_mode", "force_exit_time")
+
+
+def evaluate_combined_profit_lock(total_pnl, enabled, activation_profit, locked_profit, activated=False):
+    """Return (activated, should_exit, newly_activated, valid_thresholds)."""
+    if not enabled:
+        return False, False, False, True
+    try:
+        activation_profit = float(activation_profit)
+        locked_profit = float(locked_profit)
+    except (TypeError, ValueError):
+        return bool(activated), False, False, False
+    if (not math.isfinite(activation_profit) or not math.isfinite(locked_profit)
+            or activation_profit < 0 or locked_profit < 0 or locked_profit >= activation_profit):
+        return bool(activated), False, False, False
+    newly_activated = not activated and total_pnl >= activation_profit
+    activated = bool(activated or newly_activated)
+    should_exit = activated and total_pnl <= locked_profit
+    return activated, should_exit, newly_activated, True
+
+
+def _profit_lock_position_key(position):
+    """Stable fingerprint so a latched lock can resume with a recovered position."""
+    identity = "|".join((
+        str(position.get("tradingsymbol", "")),
+        f"{float(position.get('entry_price') or 0):.8f}",
+    ))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _stored_profit_lock_positions():
+    try:
+        import trading_journal
+        return trading_journal.get_active_profit_lock_positions()
+    except Exception:
+        return set()
+
+
+def _save_profit_lock_positions(position_keys, log):
+    try:
+        import trading_journal
+        trading_journal.set_active_profit_lock_positions(position_keys)
+    except Exception as exc:  # journal persistence must not break live risk checks
+        log(f"[engine] WARNING: could not persist profit-lock activation state: {exc!r}")
+
+
+def _prune_profit_lock_positions(active_positions):
+    """Discard lock latches for positions that are no longer open at FYERS."""
+    try:
+        import trading_journal
+        saved = trading_journal.get_active_profit_lock_positions()
+        current = {_profit_lock_position_key(position) for position in active_positions}
+        trading_journal.set_active_profit_lock_positions(saved & current)
+    except Exception:
+        pass
 
 
 def _read_live_exit_settings(settings, settings_path, log):
     """
-    Re-read ONLY the SL/Target/time-exit/force-exit-time/pnl_mode fields from
+    Re-read ONLY the SL/Target/profit-lock/time-exit/force-exit-time/pnl_mode fields from
     settings.json fresh on every monitoring-loop tick, so changing them in
     the UI (Settings -> Save) while a position is already open takes effect
     immediately - no more Stop+re-enter needed just to tighten/loosen a
@@ -820,6 +909,12 @@ def monitor_and_exit(kite_client, positions, settings, stop_event, log, on_event
     live = dict(settings)  # seed with the entry-time snapshot, then live-refreshed every tick below
     last_stale_warning_at = 0.0
     last_logged_exit_settings = None
+    position_lock_keys = {_profit_lock_position_key(position) for position in positions}
+    profit_lock_activated = bool(position_lock_keys & _stored_profit_lock_positions())
+    if profit_lock_activated:
+        log("[engine] resumed previously activated combined profit lock for the open FYERS position")
+    warned_profit_lock_mode = False
+    warned_profit_lock_config = False
 
     while positions:
         if stop_event.is_set():
@@ -830,11 +925,18 @@ def monitor_and_exit(kite_client, positions, settings, stop_event, log, on_event
             break
 
         live.update(_read_live_exit_settings(settings, settings_path, log))
+        if profit_lock_activated and not live.get("profit_lock_enabled", False):
+            profit_lock_activated = False
+            log("[engine] combined profit lock disabled while position is open; activation state cleared")
+            _save_profit_lock_positions(_stored_profit_lock_positions() - position_lock_keys, log)
         exit_settings_now = {k: live.get(k) for k in _EXIT_SETTING_KEYS}
         if last_logged_exit_settings is not None and exit_settings_now != last_logged_exit_settings:
             log(f"[engine] SL/Target/time-exit settings changed while position is open - now using: "
                 f"sl_enabled={live.get('sl_enabled')} max_loss={live.get('max_loss')} "
                 f"target_enabled={live.get('target_enabled')} target_profit={live.get('target_profit')} "
+                f"profit_lock_enabled={live.get('profit_lock_enabled')} "
+                f"profit_lock_activation={live.get('profit_lock_activation')} "
+                f"profit_lock_amount={live.get('profit_lock_amount')} "
                 f"time_exit_enabled={live.get('time_exit_enabled')} time_exit={live.get('time_exit')} "
                 f"pnl_mode={live.get('pnl_mode', 'COMBINED')}")
         last_logged_exit_settings = exit_settings_now
@@ -891,7 +993,34 @@ def monitor_and_exit(kite_client, positions, settings, stop_event, log, on_event
                 square_off_all(kite_client, positions, log, reason="TARGET")
                 _emit(on_event, {"type": "exit", "reason": "TARGET", "positions": snapshot})
                 break
+            activation = live.get("profit_lock_activation", 2000)
+            lock_floor = live.get("profit_lock_amount", 1000)
+            profit_lock_activated, lock_hit, newly_activated, valid_lock = evaluate_combined_profit_lock(
+                total_pnl, bool(live.get("profit_lock_enabled", False)), activation, lock_floor,
+                activated=profit_lock_activated)
+            if not valid_lock and not warned_profit_lock_config:
+                log("[engine] WARNING: invalid profit lock settings; expected activation > locked floor >= 0; "
+                    "profit lock skipped until corrected")
+                warned_profit_lock_config = True
+            elif valid_lock:
+                warned_profit_lock_config = False
+            if newly_activated:
+                log(f"[engine] combined profit lock activated: pnl={total_pnl:.2f} "
+                    f">= activation={float(activation):.2f}; locked floor={float(lock_floor):.2f}")
+                _save_profit_lock_positions(_stored_profit_lock_positions() | position_lock_keys, log)
+                _emit(on_event, {"type": "profit_lock_activated", "total_pnl": total_pnl,
+                                "activation_profit": float(activation), "locked_profit": float(lock_floor)})
+            if lock_hit:
+                log(f"[engine] combined profit lock hit: pnl={total_pnl:.2f} <= floor={float(lock_floor):.2f}")
+                snapshot = _positions_snapshot(positions)
+                square_off_all(kite_client, positions, log, reason="PROFIT_LOCK")
+                _emit(on_event, {"type": "exit", "reason": "PROFIT_LOCK", "positions": snapshot,
+                                "total_pnl": total_pnl, "locked_profit": float(lock_floor)})
+                break
         else:  # per-leg / individual pnl mode
+            if live.get("profit_lock_enabled") and not warned_profit_lock_mode:
+                log("[engine] WARNING: profit lock requires pnl_mode=COMBINED; it is not applied per leg")
+                warned_profit_lock_mode = True
             for p in list(positions):
                 if live.get("sl_enabled") and p["pnl"] <= -abs(live["max_loss"]):
                     log(f"[engine] leg SL hit: {p['tradingsymbol']} pnl={p['pnl']:.2f}")
@@ -909,6 +1038,12 @@ def monitor_and_exit(kite_client, positions, settings, stop_event, log, on_event
         # (ticks themselves update the in-memory store asynchronously via
         # the FYERS market-data socket callback, not via this wait).
         stop_event.wait(timeout=1)
+
+    # Normal completion means these tracked positions are flat. An abrupt
+    # process crash skips this cleanup, preserving an activated lock for
+    # resume_existing_position() after FYERS positions are reconciled.
+    if position_lock_keys:
+        _save_profit_lock_positions(_stored_profit_lock_positions() - position_lock_keys, log)
 
 
 def _run_analysis(kite_client, universe, settings, log, on_event):
@@ -1282,8 +1417,90 @@ def _run_analysis(kite_client, universe, settings, log, on_event):
         f"large_gap={large_gap}, range_too_tight={range_too_tight}, "
         f"required_move(call/put/both)={required_move_call}/{required_move_put}/{required_move_both})")
 
+    decision_time = datetime.datetime.now(datetime.timezone.utc)
+    quote_received_at = universe["initial_quote"].get("received_at_utc")
+    spot_quote_age_seconds = None
+    if quote_received_at:
+        try:
+            received = datetime.datetime.fromisoformat(str(quote_received_at))
+            spot_quote_age_seconds = max(0.0, (decision_time - received).total_seconds())
+        except (TypeError, ValueError):
+            pass
+    quality_inputs = {
+        "spot_price": spot_price, "india_vix": india_vix, "daily_average_range": gap_result.get("avg_range"),
+        "historical_open_to_close_range": historical_oc_range, "option_chain_pcr": oi_result.get("pcr"),
+        "weighted_pcr": oi_result.get("weighted_pcr"), "vwap": vwap_result.get("vwap"),
+        "orb_high": orb_result.get("orb_high"), "orb_low": orb_result.get("orb_low"),
+        "atm_call_premium": ce_premium, "atm_put_premium": pe_premium,
+        "resistance_oi_change": oi_change.get("resistance_oi_change_ratio"),
+        "support_oi_change": oi_change.get("support_oi_change_ratio"),
+        "atm_ce_oi_change": oi_change.get("atm_ce_oi_change_ratio"),
+        "atm_pe_oi_change": oi_change.get("atm_pe_oi_change_ratio"),
+    }
+    input_quality = {
+        "missing_inputs": [name for name, value in quality_inputs.items() if value is None],
+        "spot_quote": {"received_at_utc": quote_received_at,
+                       "source_timestamp": universe["initial_quote"].get("source_timestamp"),
+                       "age_at_decision_seconds": spot_quote_age_seconds,
+                       "status": ("stale" if spot_quote_age_seconds is not None and spot_quote_age_seconds > 30
+                                 else "fresh_at_capture" if spot_quote_age_seconds is not None else "freshness_unknown")},
+        "option_chain_oi": {"status": "available" if strike_oi_data else "missing",
+                            "freshness": "source timestamp unavailable"},
+        "ai": {"provider": ai_result.get("provider", settings.get("ai_provider", "gemini")),
+               "request_status": ai_result.get("request_status", "unknown"),
+               "grounding_status": ai_result.get("grounding_status", "unknown")},
+    }
+    training_snapshot = {
+        "feature_schema_version": 1,
+        "decision_time_utc": decision_time.isoformat(),
+        "instrument": {"index": settings.get("index"), "spot_symbol": universe.get("spot_symbol"),
+                       "spot_price": spot_price, "atm_strike": universe.get("atm_strike"),
+                       "strike_interval": universe.get("strike_interval"),
+                       "expiry": str(universe.get("nearest_expiry")),
+                       "atm_call_symbol": universe["instruments_by_strike"][universe["atm_strike"]]["CE"]["tradingsymbol"],
+                       "atm_put_symbol": universe["instruments_by_strike"][universe["atm_strike"]]["PE"]["tradingsymbol"]},
+        "raw_inputs": {"spot_quote": universe.get("initial_quote"), "strike_oi": strike_oi_data,
+                       "strike_volume": strike_volume_data, "oi_change": oi_change,
+                       "daily_candles": daily_candles,
+                       "vwap_source_input": universe.get("vwap_source_input"),
+                       "opening_range_candles": orb_result.get("opening_candles")},
+        "intermediate_scores": {"oi_walls": oi_walls, "oi_bias": oi_result, "vwap": vwap_result,
+                                "orb": orb_result, "gap": gap_result, "cpr_width_ratio": cpr_width_ratio,
+                                "base_probability": base_prob_result, "momentum": momentum_result,
+                                "volatility_confidence": volatility_confidence,
+                                "technical_bias": technical_bias},
+        "probability": {"base_upside": base_prob_result.get("upside_probability"),
+                        "signal_votes": prob_result.get("signal_votes"),
+                        "signal_adjustments": prob_result.get("signal_adjustments"),
+                        "net_adjustment": prob_result.get("net_adjustment"),
+                        "unclamped_upside": prob_result.get("unclamped_upside_probability"),
+                        "upside": prob_result.get("upside_probability"),
+                        "downside": prob_result.get("downside_probability"),
+                        "call_threshold": call_threshold, "put_threshold": put_threshold},
+        "profitability": {"call_premium": ce_premium, "put_premium": pe_premium,
+                          "profit_margin_factor": profit_margin_factor,
+                          "required_call_move": required_move_call, "required_put_move": required_move_put,
+                          "required_both_move": required_move_both,
+                          "expected_move": expected_move,
+                          "call_expected_move_clears_threshold": (expected_move >= required_move_call
+                              if expected_move is not None and required_move_call is not None else None),
+                          "put_expected_move_clears_threshold": (expected_move >= required_move_put
+                              if expected_move is not None and required_move_put is not None else None),
+                          "both_expected_move_clears_threshold": (expected_move >= required_move_both
+                              if expected_move is not None and required_move_both is not None else None),
+                          "range_too_tight": range_too_tight, "large_gap": large_gap},
+        "ai": {"provider": ai_result.get("provider", settings.get("ai_provider", "gemini")),
+               "model": ai_result.get("model"), "request_status": ai_result.get("request_status"),
+               "grounding_status": ai_result.get("grounding_status"),
+               "sentiment": ai_result.get("sentiment"), "reason": ai_result.get("reason"),
+               "search_context": ai_result.get("tavily_results")},
+        "market_regime": {"large_gap": large_gap, "volatility_confidence": volatility_confidence,
+                          "orb_bias": orb_result.get("orb_bias"), "cpr_width_ratio": cpr_width_ratio},
+    }
+
     _emit(on_event, {
         "type": "decision",
+        "signal_time_utc": decision_time.isoformat(),
         "index": settings.get("index"),
         "spot_price": spot_price,
         "technical_bias": technical_bias,
@@ -1293,6 +1510,8 @@ def _run_analysis(kite_client, universe, settings, log, on_event):
         "atm_oi_bias": atm_oi_bias,
         "atm_ce_oi_change_ratio": oi_change["atm_ce_oi_change_ratio"],
         "atm_pe_oi_change_ratio": oi_change["atm_pe_oi_change_ratio"],
+        "strike_oi_data": strike_oi_data,
+        "strike_volume_data": strike_volume_data,
         "vwap_bias": vwap_result["vwap_bias"],
         "vwap": vwap_result["vwap"],
         "vwap_source_tradingsymbol": universe.get("futures_tradingsymbol"),
@@ -1303,12 +1522,18 @@ def _run_analysis(kite_client, universe, settings, log, on_event):
         "cpr_width_ratio": cpr_width_ratio,
         "ai_sentiment": ai_result["sentiment"],
         "ai_reason": ai_result["reason"],
+        "ai_provider": ai_result.get("provider", settings.get("ai_provider", "gemini")),
+        "ai_model": ai_result.get("model"),
+        "ai_request_status": ai_result.get("request_status"),
+        "ai_grounding_status": ai_result.get("grounding_status"),
         "large_gap": large_gap,
         "gap_points": gap_result["gap"],
         "avg_range": gap_result["avg_range"],
         "range_too_tight": range_too_tight,
         "ce_premium": ce_premium,
         "pe_premium": pe_premium,
+        "atm_call_symbol": training_snapshot["instrument"]["atm_call_symbol"],
+        "atm_put_symbol": training_snapshot["instrument"]["atm_put_symbol"],
         "profit_margin_factor": profit_margin_factor,
         "required_move_call": required_move_call,
         "required_move_put": required_move_put,
@@ -1346,6 +1571,8 @@ def _run_analysis(kite_client, universe, settings, log, on_event):
         "call_probability_threshold": call_threshold,
         "put_probability_threshold": put_threshold,
         "direction": direction,
+        "input_quality": input_quality,
+        "training_snapshot": training_snapshot,
     })
 
     return direction

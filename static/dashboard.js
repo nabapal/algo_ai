@@ -59,15 +59,16 @@
   // ------------------------------------------------------------ settings form
 
   const providerSelect = $("ai_provider");
-  function bindToggle(checkboxId, inputId) {
+  function bindToggle(checkboxId, ...inputIds) {
     const cb = $(checkboxId);
-    const input = $(inputId);
-    function sync() { input.disabled = !cb.checked; }
+    const inputs = inputIds.map((id) => $(id));
+    function sync() { inputs.forEach((input) => { input.disabled = !cb.checked; }); }
     cb.addEventListener("change", sync);
     sync();
   }
   bindToggle("sl_enabled", "max_loss");
   bindToggle("target_enabled", "target_profit");
+  bindToggle("profit_lock_enabled", "profit_lock_activation", "profit_lock_amount");
   bindToggle("time_exit_enabled", "time_exit");
   bindToggle("proxy_enabled", "proxy_host");
 
@@ -136,6 +137,9 @@
       max_loss: parseFloat($("max_loss").value) || 0,
       target_enabled: $("target_enabled").checked,
       target_profit: parseFloat($("target_profit").value) || 0,
+      profit_lock_enabled: $("profit_lock_enabled").checked,
+      profit_lock_activation: parseFloat($("profit_lock_activation").value) || 0,
+      profit_lock_amount: parseFloat($("profit_lock_amount").value) || 0,
       time_exit_enabled: $("time_exit_enabled").checked,
       time_exit: $("time_exit").value || "10:30",
       profit_margin_factor: parseFloat($("profit_margin_factor").value) || 1,
@@ -195,6 +199,14 @@
   let loggedIn = false;
   let running = false;
   let loggingIn = false;
+  let lastSpotQuoteAt = null;
+
+  function setMarketLiveState(status) {
+    const el = $("marketLiveStatus");
+    if (!el) return;
+    el.className = "live-indicator " + status.toLowerCase();
+    el.innerHTML = `<i></i> ${status}`;
+  }
 
   function setHint(text, kind) {
     controlHint.textContent = text || "";
@@ -215,6 +227,10 @@
     manualTradeBtns.forEach(btn => { btn.disabled = !loggedIn || running || !window.__CONFIGURED__; });
     loginDot.classList.toggle("on", loggedIn);
     engineStatusText.textContent = running ? "Running" : (loggedIn ? "Logged in - idle" : "Idle");
+    if (!loggedIn) setMarketLiveState("OFFLINE");
+    else if (running) setMarketLiveState("CONNECTING");
+    else if (lastSpotQuoteAt === null) setMarketLiveState("CONNECTING");
+    else setMarketLiveState(Date.now() - lastSpotQuoteAt > FEED_STALE_MS ? "STALE" : "LIVE");
     syncAtmPreviewPolling();
     syncSpotFeed();
   }
@@ -252,6 +268,8 @@
       }
       atmPreviewUnavailable.style.display = "none";
       lastKnownLots = data.lots;
+      lastSpotQuoteAt = Date.now();
+      if (!running) setMarketLiveState("LIVE");
       $("previewCallPrice").textContent = fmtOptionPrice(data.call.ltp);
       $("previewPutPrice").textContent = fmtOptionPrice(data.put.ltp);
       $("previewBothPrice").textContent = fmtOptionPrice(data.both_combined_ltp);
@@ -415,11 +433,11 @@
   }
 
   const chart = LightweightCharts.createChart(chartEl, {
-    layout: { background: { color: "#ffffff" }, textColor: "#475467", fontFamily: "Inter, sans-serif" },
-    grid: { vertLines: { color: "#F0F0F0" }, horzLines: { color: "#F0F0F0" } },
-    rightPriceScale: { borderColor: "#E4E7EC" },
+    layout: { background: { color: "#071827" }, textColor: "#9bb3cb", fontFamily: "Inter, sans-serif" },
+    grid: { vertLines: { color: "#102b40" }, horzLines: { color: "#102b40" } },
+    rightPriceScale: { borderColor: "#1a3d56" },
     timeScale: {
-      borderColor: "#E4E7EC", timeVisible: true, secondsVisible: false,
+      borderColor: "#1a3d56", timeVisible: true, secondsVisible: false,
       tickMarkFormatter: formatLocalTime,
     },
     localization: { timeFormatter: formatLocalTime },
@@ -433,10 +451,30 @@
     handleScale: { mouseWheel: false, axisPressedMouseMove: true, pinch: true },
   });
   const candleSeries = chart.addCandlestickSeries({
-    upColor: "#16A34A", downColor: "#DC2626",
-    borderUpColor: "#16A34A", borderDownColor: "#DC2626",
-    wickUpColor: "#16A34A", wickDownColor: "#DC2626",
+    upColor: "#00c982", downColor: "#ff5364",
+    borderUpColor: "#00c982", borderDownColor: "#ff5364",
+    wickUpColor: "#00c982", wickDownColor: "#ff5364",
   });
+  let chartPriceLines = [];
+  function clearChartLevels() {
+    chartPriceLines.forEach(line => candleSeries.removePriceLine(line));
+    chartPriceLines = [];
+  }
+  function addChartLevel(price, title, color, style) {
+    if (price === null || price === undefined || !Number.isFinite(Number(price))) return;
+    chartPriceLines.push(candleSeries.createPriceLine({
+      price: Number(price), title, color, lineWidth: 1,
+      lineStyle: style, axisLabelVisible: true, lineVisible: true,
+    }));
+  }
+  function setChartLevels(evt) {
+    clearChartLevels();
+    addChartLevel(evt.vwap, "VWAP", "#ff9d3d", LightweightCharts.LineStyle.Solid);
+    addChartLevel(evt.orb_high, "ORB High", "#12b8ff", LightweightCharts.LineStyle.Dashed);
+    addChartLevel(evt.orb_low, "ORB Low", "#12b8ff", LightweightCharts.LineStyle.Dashed);
+    addChartLevel(evt.resistance_strike, "Resistance", "#ff5364", LightweightCharts.LineStyle.Dashed);
+    addChartLevel(evt.support_strike, "Support", "#00c982", LightweightCharts.LineStyle.Dashed);
+  }
 
   window.addEventListener("resize", () => {
     chart.applyOptions({ width: chartEl.clientWidth, height: chartEl.clientHeight });
@@ -477,6 +515,7 @@
       currentCandle = data.candles[data.candles.length - 1];
       spotToken = data.spot_token;
       $("chartTitle").textContent = data.spot_symbol + " — Live";
+      $("marketInstrument").textContent = data.spot_symbol || "Index Options";
       spotChartLoaded = true;
     } catch (err) {
       // transient network hiccup - the periodic poll below will keep trying
@@ -490,6 +529,8 @@
       const resp = await fetch("/api/spot_ltp");
       const data = await resp.json();
       if (!data.ok || data.ltp === null || data.ltp === undefined) return;
+      lastSpotQuoteAt = Date.now();
+      setMarketLiveState("LIVE");
       $("ltpValue").textContent = fmtPrice(data.ltp);
       feedSpotPrice(data.ltp);
     } catch (err) {
@@ -522,6 +563,13 @@
   function setDirectionBadge(el, value) {
     el.textContent = value || "—";
     el.className = "value direction-badge " + (value || "");
+    if (el.id === "finalDirection") {
+      const signalDirection = $("signalFinalDirection");
+      if (signalDirection) {
+        signalDirection.textContent = value || "—";
+        signalDirection.className = "value direction-badge large " + (value || "");
+      }
+    }
   }
 
   function setVolConfBadge(vc, evt) {
@@ -678,6 +726,7 @@
         $("ltpValue").textContent = fmtPrice(tick.last_price);
         feedSpotPrice(tick.last_price);
         lastTickReceivedAt = Date.now();
+        setMarketLiveState("LIVE");
       }
     }
   });
@@ -685,12 +734,16 @@
   function refreshFeedStatus() {
     if (!running) {
       feedStatusEl.style.display = "none";
+      if (!loggedIn) setMarketLiveState("OFFLINE");
+      else if (lastSpotQuoteAt === null) setMarketLiveState("CONNECTING");
+      else setMarketLiveState(Date.now() - lastSpotQuoteAt > FEED_STALE_MS ? "STALE" : "LIVE");
       return;
     }
     feedStatusEl.style.display = "inline-block";
     const isStale = lastTickReceivedAt === null || (Date.now() - lastTickReceivedAt > FEED_STALE_MS);
     feedStatusEl.className = "feed-status " + (isStale ? "stale" : "live");
     feedStatusEl.textContent = isStale ? "Stale" : "Live";
+    setMarketLiveState(isStale ? "STALE" : "LIVE");
   }
   setInterval(refreshFeedStatus, 3000);
 
@@ -713,6 +766,10 @@
         $("chartTitle").textContent = evt.spot_symbol + " — Live";
         $("chartSubtitle").textContent =
           `ATM ${evt.atm_strike} · expiry ${evt.nearest_expiry} · strike step ${evt.strike_interval}`;
+        $("marketInstrument").textContent = evt.spot_symbol || `${evt.index || "Index"} Options`;
+        $("marketExpiry").textContent = evt.nearest_expiry || "—";
+        $("marketAtm").textContent = evt.atm_strike ?? "—";
+        $("marketStrikeStep").textContent = evt.strike_interval ?? "—";
         lastTickReceivedAt = null;
         break;
 
@@ -736,6 +793,18 @@
           setDirectionBadge($("momentumBias"), null); $("momentumBias").title = "";
           $("largeGap").textContent = "—"; $("largeGap").title = "";
           setDirectionBadge($("finalDirection"), evt.direction);
+          $("marketChange").textContent = "—";
+          $("marketChange").className = "market-change neutral";
+          $("marketVix").textContent = "—";
+          $("pcrValue").textContent = "—";
+          $("weightedPcrValue").textContent = "—";
+          $("atmCeOiChange").textContent = "—";
+          $("atmPeOiChange").textContent = "—";
+          $("vixExpectedMove").textContent = "—";
+          $("historicalMove").textContent = "—";
+          $("blendedMove").textContent = "—";
+          $("moveConsumed").textContent = "—";
+          clearChartLevels();
           $("decisionRuleInfo").title = "Manual override - entered directly, no analysis performed";
 
           $("probBar").style.display = "none";
@@ -807,6 +876,23 @@
         $("largeGap").title = (evt.gap_points !== null && evt.gap_points !== undefined)
           ? `Gap ${evt.gap_points.toFixed(0)} pts vs avg range ${evt.avg_range.toFixed(0)} pts` : "";
         setDirectionBadge($("finalDirection"), evt.direction);
+        $("marketVix").textContent = evt.india_vix == null ? "—" : evt.india_vix.toFixed(2);
+        $("pcrValue").textContent = evt.pcr == null ? "—" : evt.pcr.toFixed(3);
+        $("weightedPcrValue").textContent = evt.weighted_pcr == null ? "—" : evt.weighted_pcr.toFixed(3);
+        const formatOiChange = (ratio) => ratio == null ? "—" : `${ratio >= 1 ? "+" : ""}${((ratio - 1) * 100).toFixed(1)}%`;
+        $("atmCeOiChange").textContent = formatOiChange(evt.atm_ce_oi_change_ratio);
+        $("atmPeOiChange").textContent = formatOiChange(evt.atm_pe_oi_change_ratio);
+        $("atmCeOiChange").className = "";
+        $("atmPeOiChange").className = "";
+        $("marketChange").textContent = evt.points_moved_from_open == null ? "—" :
+          `${evt.points_moved_from_open >= 0 ? "+" : ""}${evt.points_moved_from_open.toFixed(2)} from open`;
+        $("marketChange").className = "market-change " + (evt.points_moved_from_open > 0 ? "profit" : evt.points_moved_from_open < 0 ? "loss" : "neutral");
+        $("vixExpectedMove").textContent = evt.vix_expected_move == null ? "—" : `±${evt.vix_expected_move.toFixed(1)} pts`;
+        $("historicalMove").textContent = evt.historical_oc_range == null ? "—" : `±${evt.historical_oc_range.toFixed(1)} pts`;
+        $("blendedMove").textContent = evt.expected_move == null ? "—" : `±${evt.expected_move.toFixed(1)} pts`;
+        $("moveConsumed").textContent = evt.momentum_used_fraction == null ? "—" :
+          `${Math.round(Math.abs(evt.momentum_used_fraction) * 100)}%${evt.points_moved_from_open == null ? "" : ` · ${evt.points_moved_from_open >= 0 ? "+" : ""}${evt.points_moved_from_open.toFixed(1)} pts`}`;
+        setChartLevels(evt);
 
         $("probBarEmpty").style.display = "none";
         $("probBar").style.display = "flex";
@@ -1043,21 +1129,47 @@
     return text;
   }
 
+  let journalPerformanceData = null;
+  function renderJournalPerformance() {
+    const container = $("journalPerformance");
+    if (!container) return;
+    if (!journalPerformanceData) {
+      container.textContent = "Performance report unavailable.";
+      return;
+    }
+    const dimension = $("journalPerformanceDimension")?.value || "by_horizon";
+    const rows = journalPerformanceData[dimension] || [];
+    if (!rows.length) {
+      container.textContent = `No completed outcomes yet (${journalPerformanceData.prediction_count || 0} signals recorded).`;
+      return;
+    }
+    const percent = value => value == null ? "—" : `${(Number(value) * 100).toFixed(1)}%`;
+    container.innerHTML = `<div class="journal-table-wrap"><table class="journal-table"><thead><tr>` +
+      `<th>Horizon</th><th>Group</th><th>Samples</th><th>Directional N</th><th>Accuracy</th>` +
+      `<th>Predicted Up</th><th>Observed Up</th><th>Brier</th><th>Special Labels</th><th>Net P&amp;L</th><th>Sample</th>` +
+      `</tr></thead><tbody>${rows.map(row => {
+        const labels = `No-trade call/put ${row.no_trade_call_opportunity_count || 0}/${row.no_trade_put_opportunity_count || 0}; ` +
+          `BOTH profitable ${row.both_leg_profitable_count || 0}`;
+        return `<tr><td>${escapeHtml(row.horizon)}</td><td>${escapeHtml(row.value)}</td>` +
+          `<td>${row.sample_count}</td><td>${row.directional_sample_count}</td>` +
+          `<td>${percent(row.directional_accuracy)}</td><td>${percent(row.mean_predicted_up_probability)}</td>` +
+          `<td>${percent(row.observed_up_frequency)}</td><td>${row.brier_score == null ? "—" : Number(row.brier_score).toFixed(3)}</td>` +
+          `<td>${escapeHtml(labels)}</td><td>Unavailable</td><td>${escapeHtml(row.sample_assessment)}</td></tr>`;
+      }).join("")}</tbody></table></div>`;
+  }
+  $("journalPerformanceDimension")?.addEventListener("change", renderJournalPerformance);
+
   async function loadJournal() {
     const response = await fetch("/api/journal?limit=100");
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(data.error || "Journal could not be loaded");
     const recs = data.recommendations || [];
-    const activity = data.activity || [];
-    const charges = data.charges || [];
     const captured = recs.filter(r => !r.manual);
     const tracked = captured.flatMap(r => [r.outcomes?.["15m"], r.outcomes?.close])
       .filter(o => o && typeof o.directional_correct === "boolean");
     const correct = tracked.filter(o => o.directional_correct).length;
     $("journalSummary").textContent =
-      `${captured.length} analyzed recommendations · ${correct}/${tracked.length} directional checks correct · ` +
-      `${activity.filter(x => x.kind === "order").length} FYERS orders · ` +
-      `${activity.filter(x => x.kind === "trade").length} executions · ${charges.length} charge report(s)`;
+      `${captured.length} analyzed recommendations · ${correct}/${tracked.length} directional checks correct`;
 
     $("journalRecommendations").innerHTML = recs.length ? recs.map(r => {
       const universe = r.universe || {};
@@ -1073,43 +1185,16 @@
         `<td>${escapeHtml(journalOutcome(r.outcomes?.["60m"]))}</td>` +
         `<td>${escapeHtml(journalOutcome(r.outcomes?.close))}</td></tr>`;
     }).join("") : `<tr><td colspan="9" class="muted">No recommendations recorded yet.</td></tr>`;
-
-    $("journalActivity").innerHTML = activity.length ? activity.map(item => {
-      const price = item.price == null ? "—" : fmtMoney(Number(item.price));
-      const sourceLabels = { M: "FYERS App", W: "FYERS Web", A: "Admin", ITS: "API" };
-      const source = sourceLabels[item.source] || item.source || "UNKNOWN";
-      return `<tr><td>${journalTime(item.event_time || item.synced_at)}</td><td>${escapeHtml(source)}</td>` +
-        `<td>${escapeHtml(item.kind)}</td><td>${escapeHtml(item.symbol || "—")}</td>` +
-        `<td>${escapeHtml(item.side || "—")}</td><td>${escapeHtml(item.quantity ?? "—")}</td>` +
-        `<td>${escapeHtml(price)}</td><td>${escapeHtml(item.status || "—")}</td></tr>`;
-    }).join("") : `<tr><td colspan="8" class="muted">No FYERS account activity received yet. Log in, then sync.</td></tr>`;
-
-    $("journalCharges").innerHTML = charges.length ? charges.map(report => {
-      const total = report.total == null ? "FYERS report received" : `Reported total ${fmtMoney(Number(report.total))}`;
-      return `<details class="journal-charge-row"><summary>${escapeHtml(report.report_date)} · ${escapeHtml(total)}</summary>` +
-        `<pre>${escapeHtml(JSON.stringify(report.raw, null, 2))}</pre></details>`;
-    }).join("") : "No FYERS charge report synced yet.";
-    $("journalStatus").textContent = "Saved locally in the persistent application data directory.";
-  }
-
-  $("journalSyncBtn").addEventListener("click", async () => {
-    const button = $("journalSyncBtn");
-    button.disabled = true;
-    $("journalStatus").textContent = "Syncing order book, trade book, and charges from FYERS…";
     try {
-      const result = await postJSON("/api/journal/sync", {});
-      await loadJournal();
-      toast(`Synced ${result.orders} orders and ${result.trades} executions`, "success");
-      if (result.charge_message) $("journalStatus").textContent += ` Charges report: ${result.charge_message}`;
-    } catch (error) {
-      $("journalStatus").textContent = error.message;
-      toast("Journal sync failed: " + error.message, "error");
-    } finally {
-      button.disabled = false;
+      const performanceResponse = await fetch("/api/journal/performance");
+      const performance = await performanceResponse.json();
+      journalPerformanceData = performanceResponse.ok && performance.ok ? performance : null;
+    } catch (_) {
+      journalPerformanceData = null;
     }
-  });
-
-  loadJournal().catch(error => { $("journalStatus").textContent = error.message; });
+    renderJournalPerformance();
+  }
+  loadJournal().catch(error => { $("journalSummary").textContent = error.message; });
   setInterval(() => loadJournal().catch(() => {}), 30000);
 
   fetch("/api/status").then(r => r.json()).then(applyStatus).catch(() => {});

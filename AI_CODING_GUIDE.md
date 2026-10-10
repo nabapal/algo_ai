@@ -10,7 +10,8 @@ change.
 
 This is a single-user Flask/Socket.IO dashboard and Python engine for analyzing
 and buying intraday index options through FYERS API v3. Supported underlyings
-are NIFTY 50, BANKNIFTY, FINNIFTY, and MIDCPNIFTY. It reads option-chain and
+are NIFTY 50, BANKNIFTY, FINNIFTY, and MIDCPNIFTY on NSE, plus SENSEX on BSE.
+It reads option-chain and
 market data, computes technical/probability signals, optionally asks one AI
 provider for a sentiment opinion, then either reports a recommendation or
 places/monitors orders depending on the selected action and `dry_run` setting.
@@ -30,7 +31,9 @@ position management, and order handling especially reviewable.
 | `option_signal.py` | Pure signal math: PCR/OI walls, VWAP, ORB, gaps, expected move, probability combination, confidence. |
 | `decision.py` | Pure final decision rules: CALL, PUT, BOTH, or NO_TRADE. |
 | `ai_sentiment.py` | Shared prompt, provider adapters (Gemini, Claude, OpenAI), response parsing, safe neutral fallback. |
-| `trading_journal.py` | SQLite storage for app recommendations/outcomes, FYERS account records, charge reports and sync metadata. |
+| `trading_journal.py` | SQLite storage for app recommendations/outcomes, FYERS account records and sync metadata. |
+| `deploy_oracle.ps1` | Windows PowerShell uploader for selected app files and an Oracle VM restart. |
+| `test_fyers_sensex.py` | Mocked regression coverage for SENSEX/BSE symbols, contract metadata and market status. |
 | `templates/` | Login, dashboard, FYERS callback pages. |
 | `static/dashboard.js` | Browser settings, dashboard polling, chart, events/log display and controls. |
 | `diagnose_fyers_oi.py` | FYERS option-chain/WebSocket/quote OI diagnostic using the cached token. |
@@ -119,8 +122,8 @@ are Python `datetime` objects.
 
 The instrument name comes from the selected index and is shared by the live
 AI request and `/api/prompt_preview`. Supported labels are NIFTY 50, NIFTY
-BANK (BANKNIFTY), NIFTY Financial Services (FINNIFTY), and NIFTY Midcap Select
-(MIDCPNIFTY).
+BANK (BANKNIFTY), NIFTY Financial Services (FINNIFTY), NIFTY Midcap Select
+(MIDCPNIFTY), and SENSEX.
 
 | `AI_PROVIDER` | Credential | Model setting | Transport |
 |---|---|---|---|
@@ -214,12 +217,12 @@ POST routes also require the CSRF header from the page.
 ## Trading journal
 
 `trading_journal.py` uses SQLite in `DATA_DIR`. It stores app recommendation
-events and underlying outcomes, broker order/trade records, raw broker JSON,
-and FYERS charge reports. `app.py` starts a background sync loop after FYERS
-login, backfills historical periods, then periodically syncs account activity
-and charge reports. FYERS account-wide order/trade feeds are the source for
-manual activity; the app's own recommendation log is separate from account
-fills and P&L. Charge reports may not be available immediately from FYERS.
+events and underlying outcomes, broker order/trade records, and raw broker
+JSON. `app.py` starts a background sync loop after FYERS login, backfills
+historical periods, then periodically syncs account activity. FYERS account-wide
+order/trade feeds are the source for manual activity; the app's own recommendation
+log is separate from account fills and P&L. FYERS charge-report syncing is not
+implemented.
 
 Keep sync idempotent and preserve raw broker payloads when changing field
 normalization. FYERS response envelopes vary; inspect `fyers_client.py` and
@@ -257,6 +260,23 @@ port `5000` closed for the hosted dashboard OAuth flow; the app callback is on
 the dashboard port (`5050` by default). A small memory VM should run one app
 process and one worker. Use a service manager (for restart-on-boot) rather
 than leaving a terminal session as the only process supervisor.
+
+For Windows deployments, `deploy_oracle.ps1` stages and copies only the app
+modules, `requirements.txt`, `settings.example.json`, `run.sh`, `templates`,
+and `static`, then restarts through `run.sh`. It defaults to the project's
+Oracle address and key path; use `-SshKey`, `-Remote`, and `-RemoteDir` to
+override them. It does not transfer `.env`, `settings.json`, `token.json`, logs,
+SQLite databases, tests, or documents. The upload overlays those selected
+paths without deleting unrelated remote files. Since `run.sh` installs
+requirements at startup, each deployment also performs that install. The app
+log is timestamped under the remote `logs/` directory.
+
+The FYERS adapter resolves SENSEX through `BSE:SENSEX-INDEX` and the BSE F&O
+symbol master. It keeps FYERS's `BSE` API exchange while translating to the
+legacy `BFO` key used by internal option/future interfaces. The live-market
+guard checks NSE F&O as 10/11 and BSE F&O as 12/12. This adds SENSEX, not
+SENSEX50. India VIX remains the shared volatility input across selections;
+for SENSEX it is a proxy, not a SENSEX-specific volatility index.
 
 ### Restarting
 

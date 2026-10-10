@@ -553,9 +553,11 @@ def compute_direction_probability(support_oi, resistance_oi, support_strike=None
 
     total = weighted_support + weighted_resistance
     if total <= 0:
-        return {"upside_probability": 0.5, "downside_probability": 0.5}
+        return {"upside_probability": 0.5, "downside_probability": 0.5,
+                "weighted_support_oi": weighted_support, "weighted_resistance_oi": weighted_resistance}
     upside = weighted_support / total
-    return {"upside_probability": upside, "downside_probability": 1 - upside}
+    return {"upside_probability": upside, "downside_probability": 1 - upside,
+            "weighted_support_oi": weighted_support, "weighted_resistance_oi": weighted_resistance}
 
 
 def compute_atm_oi_change_bias(atm_ce_oi_change_ratio, atm_pe_oi_change_ratio, threshold=0.1):
@@ -634,38 +636,51 @@ def combine_probability_signals(base_upside_probability, pcr, pcr_threshold, vwa
     meaningful today's realized move is - not nudging the probability by
     itself.
     """
-    net = 0
+    signal_votes = {"pcr": 0, "vwap": 0, "orb": 0, "gap": 0,
+                    "atm_oi": 0, "ai_sentiment": 0, "momentum": 0}
     if pcr is not None:
         if pcr > 1 + pcr_threshold:
-            net += 1
+            signal_votes["pcr"] = 1
         elif pcr < 1 - pcr_threshold:
-            net -= 1
+            signal_votes["pcr"] = -1
     if vwap_bias == "BULLISH":
-        net += 1
+        signal_votes["vwap"] = 1
     elif vwap_bias == "BEARISH":
-        net -= 1
+        signal_votes["vwap"] = -1
     if orb_bias == "BULLISH":
-        net += 1
+        signal_votes["orb"] = 1
     elif orb_bias == "BEARISH":
-        net -= 1
+        signal_votes["orb"] = -1
     if gap is not None:
         if gap > 0:
-            net += 1
+            signal_votes["gap"] = 1
         elif gap < 0:
-            net -= 1
+            signal_votes["gap"] = -1
     if atm_oi_bias == "BULLISH":
-        net += 1
+        signal_votes["atm_oi"] = 1
     elif atm_oi_bias == "BEARISH":
-        net -= 1
+        signal_votes["atm_oi"] = -1
     if ai_sentiment == "POSITIVE":
-        net += 1
+        signal_votes["ai_sentiment"] = 1
     elif ai_sentiment == "NEGATIVE":
-        net -= 1
+        signal_votes["ai_sentiment"] = -1
     if momentum_bias == "BULLISH":
-        net += 1
+        signal_votes["momentum"] = 1
     elif momentum_bias == "BEARISH":
-        net -= 1
+        signal_votes["momentum"] = -1
 
+    net = sum(signal_votes.values())
     upside = base_upside_probability + net * adjustment_per_signal
     upside = max(0.05, min(0.95, upside))
-    return {"upside_probability": upside, "downside_probability": 1 - upside}
+    return {
+        "upside_probability": upside,
+        "downside_probability": 1 - upside,
+        "base_upside_probability": base_upside_probability,
+        "adjustment_per_signal": adjustment_per_signal,
+        "signal_votes": signal_votes,
+        "signal_adjustments": {
+            name: vote * adjustment_per_signal for name, vote in signal_votes.items()
+        },
+        "net_adjustment": net * adjustment_per_signal,
+        "unclamped_upside_probability": base_upside_probability + net * adjustment_per_signal,
+    }

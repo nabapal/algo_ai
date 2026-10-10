@@ -17,10 +17,12 @@ Set HOST=127.0.0.1 to restrict it to local access.
 import datetime
 import hmac
 import json
+import math
 import os
 import secrets
 import threading
 import time
+import uuid
 import webbrowser
 
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
@@ -267,31 +269,30 @@ JOURNAL_SYNC_STOP = threading.Event()
 
 
 def _update_recommendation_outcomes(client, now_ist):
-    """Measure each strategy signal's later underlying move at fixed horizons."""
-    today = now_ist.date().isoformat()
-    pending = trading_journal.pending_recommendations(today)
-    if not pending:
-        return
+    """Persist real spot observations and explicit labels for prior recommendations."""
+    pending = trading_journal.pending_recommendations(limit=1000)
     grouped = {}
+    option_candle_cache = {}
     for row in pending:
         try:
-            current_outcomes = json.loads(row.get("outcomes_json") or "{}")
-            if all(key in current_outcomes for key in ("15m", "30m", "60m", "close")):
-                continue
             context = json.loads(row.get("universe_json") or "{}")
             symbol = context.get("spot_symbol")
             if symbol:
-                grouped.setdefault(symbol, []).append((row, context))
+                grouped.setdefault((symbol, row.get("trading_date")), []).append((row, context))
         except (TypeError, ValueError):
             continue
 
-    market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
-    for symbol, rows in grouped.items():
+    for (symbol, day), rows in grouped.items():
         try:
-            market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
-            candles = client.get_intraday_history_for_symbol(symbol, market_open, now_ist, "1minute")
+            trade_date = datetime.date.fromisoformat(day)
+            market_open = datetime.datetime.combine(trade_date, datetime.time(9, 15), tzinfo=trading_journal.IST)
+            market_close = datetime.datetime.combine(trade_date, datetime.time(15, 30), tzinfo=trading_journal.IST)
+            now_for_day = min(now_ist, market_close) if trade_date == now_ist.date() else market_close
+            candles = client.get_intraday_history_for_symbol(symbol, market_open, now_for_day, "1minute")
         except Exception:
+            # A transport/API failure is not evidence of zero movement or a missing market outcome.
             continue
+
         points = []
         for candle in candles:
             try:
@@ -301,106 +302,135 @@ def _update_recommendation_outcomes(client, now_ist):
             except (KeyError, TypeError, ValueError, OverflowError, OSError):
                 continue
         points.sort(key=lambda item: item[0])
-        if not points:
-            continue
+        samples = [{"timestamp": stamp.isoformat(), "price": price} for stamp, price in points]
+
         for row, context in rows:
             try:
                 created = datetime.datetime.fromisoformat(row["created_at"]).astimezone(trading_journal.IST)
-                outcomes = json.loads(row.get("outcomes_json") or "{}")
                 start_price = float(row.get("spot_price") or context.get("spot_price"))
+                outcomes = json.loads(row.get("outcomes_json") or "{}")
+                payload = json.loads(row.get("payload_json") or "{}")
             except (TypeError, ValueError):
                 continue
             if start_price <= 0:
                 continue
             direction = str(row.get("direction") or "").upper()
+            signal_samples = [sample for sample in samples
+                              if datetime.datetime.fromisoformat(sample["timestamp"]) >= created]
             targets = {"15m": created + datetime.timedelta(minutes=15),
                        "30m": created + datetime.timedelta(minutes=30),
                        "60m": created + datetime.timedelta(minutes=60),
                        "close": market_close}
-            changed = False
+            required = {"call": payload.get("required_move_call"),
+                        "put": payload.get("required_move_put"),
+                        "both": payload.get("required_move_both")}
+            changed = {}
             for horizon, target in targets.items():
-                if outcomes.get(horizon):
+                existing = outcomes.get(horizon)
+                if isinstance(existing, dict) and existing.get("status") in ("ready", "unavailable"):
                     continue
                 if horizon == "close" and created >= market_close:
                     if now_ist >= market_close + datetime.timedelta(minutes=5):
-                        outcomes[horizon] = {"status": "unavailable", "reason": "recommendation after market close"}
-                        changed = True
+                        changed[horizon] = {"status": "unavailable", "reason": "recommendation after market close"}
                     continue
                 if target > market_close:
-                    if now_ist > market_close + datetime.timedelta(minutes=10):
-                        outcomes[horizon] = {"status": "unavailable", "reason": "horizon extends past market close"}
-                        changed = True
+                    if now_ist >= market_close + datetime.timedelta(minutes=10):
+                        changed[horizon] = {"status": "unavailable", "reason": "horizon extends past market close"}
                     continue
-                eligible = [price for stamp, price in points if stamp >= target]
-                if horizon == "close" and now_ist >= market_close + datetime.timedelta(minutes=5):
-                    eligible = [price for stamp, price in points if stamp.date() == now_ist.date() and stamp <= market_close]
-                    value = eligible[-1] if eligible else None
+                if horizon == "close":
+                    if now_ist < market_close + datetime.timedelta(minutes=5):
+                        continue
+                    closing_points = [sample for sample in signal_samples
+                                      if datetime.datetime.fromisoformat(sample["timestamp"]) <= market_close]
+                    if not closing_points:
+                        if now_ist >= market_close + datetime.timedelta(minutes=10):
+                            changed[horizon] = {"status": "unavailable", "reason": "no market-close spot candle"}
+                        continue
+                    outcome = trading_journal.build_horizon_outcome(
+                        start_price, signal_samples, direction, closing_points[-1]["timestamp"], required_moves=required)
+                    if outcome.get("status") == "ready":
+                        outcome["target_at"] = market_close.isoformat()
                 else:
-                    value = eligible[0] if eligible and target <= now_ist else None
-                if value is not None:
-                    move = value - start_price
-                    correct = move > 0 if direction == "CALL" else move < 0 if direction == "PUT" else None
-                    outcomes[horizon] = {"status": "ready", "target_at": target.isoformat(),
-                                         "spot": value, "move_points": move, "directional_correct": correct}
-                    changed = True
-                elif now_ist > target + datetime.timedelta(minutes=10):
-                    outcomes[horizon] = {"status": "unavailable", "reason": "no candle at target horizon"}
-                    changed = True
+                    if now_ist < target:
+                        continue
+                    outcome = trading_journal.build_horizon_outcome(
+                        start_price, signal_samples, direction, target.isoformat(), required_moves=required)
+                    if outcome.get("status") == "pending":
+                        if now_ist > target + datetime.timedelta(minutes=10):
+                            outcome = {"status": "unavailable", "reason": "no spot candle at or after target"}
+                        else:
+                            continue
+                if direction == "BOTH" and outcome.get("status") == "ready":
+                    call_symbol = payload.get("atm_call_symbol") or context.get("atm_call_symbol")
+                    put_symbol = payload.get("atm_put_symbol") or context.get("atm_put_symbol")
+                    entries = {"call": payload.get("ce_premium"), "put": payload.get("pe_premium")}
+                    exits = {}
+                    option_history_available = True
+                    for leg, option_symbol in (("call", call_symbol), ("put", put_symbol)):
+                        if not option_symbol or entries[leg] is None:
+                            option_history_available = False
+                            break
+                        cache_key = (day, option_symbol)
+                        if cache_key not in option_candle_cache:
+                            try:
+                                option_candles = client.get_intraday_history_for_symbol(
+                                    option_symbol, market_open, now_for_day, "1minute")
+                                option_candle_cache[cache_key] = [
+                                    {"timestamp": datetime.datetime.fromtimestamp(
+                                        int(candle["date"]), datetime.timezone.utc).astimezone(
+                                            trading_journal.IST).isoformat(), "price": float(candle["close"])}
+                                    for candle in option_candles
+                                ]
+                            except Exception:
+                                option_candle_cache[cache_key] = None
+                        option_samples = option_candle_cache[cache_key]
+                        if option_samples is None:
+                            option_history_available = False
+                            break
+                        matching = [sample for sample in option_samples
+                                    if sample["timestamp"] >= outcome["observed_at"]]
+                        if matching:
+                            exits[leg] = matching[0]["price"]
+                        else:
+                            option_history_available = False
+                            break
+                    if option_history_available:
+                        outcome = trading_journal.build_horizon_outcome(
+                            start_price, signal_samples, direction, outcome["observed_at"],
+                            required_moves=required, option_entry_premiums=entries,
+                            option_exit_premiums=exits)
+                    elif now_ist > target + datetime.timedelta(minutes=10):
+                        outcome["both_leg_profitability"] = {
+                            "status": "unavailable", "reason": "FYERS option-price history not available at horizon"}
+                    else:
+                        continue
+                if outcome.get("status") == "ready":
+                    outcome["opportunity_context"] = {
+                        "decision": direction,
+                        "label_method": ("directional spot movement; not realized trading P&L"
+                                         if direction in ("CALL", "PUT") else
+                                         "separate underlying-move premium-threshold proxy"),
+                    }
+                changed[horizon] = outcome
             if changed:
-                trading_journal.update_recommendation_outcomes(row["id"], outcomes)
-
+                trading_journal.update_recommendation_outcomes(row["id"], changed)
 
 def _journal_sync_loop():
-    last_charge_sync = {}
     last_outcome_sync = 0.0
     last_error_log = 0.0
-    last_history_attempt = 0.0
     log = _make_log()
     while not JOURNAL_SYNC_STOP.is_set():
         with STATE_LOCK:
             client = STATE.get("kite_client") if STATE.get("logged_in") else None
         if client is not None:
             now_ist = datetime.datetime.now(trading_journal.IST)
-            today = now_ist.date()
-            try:
-                cursor = trading_journal.get_meta("activity_history_through")
-                history_start = datetime.date.fromisoformat(cursor) + datetime.timedelta(days=1) if cursor else today - datetime.timedelta(days=29)
-                history_end = min(today - datetime.timedelta(days=1), history_start + datetime.timedelta(days=29))
-                if history_start <= history_end and time.monotonic() - last_history_attempt >= 30:
-                    last_history_attempt = time.monotonic()
-                    history = client.journal_history(history_start.isoformat(), history_end.isoformat())
-                    trading_journal.store_broker_records("order", history["orders"])
-                    trading_journal.store_broker_records("trade", history["trades"])
-                    trading_journal.store_charge_history(history_start.isoformat(), history_end.isoformat(), history["charges"])
-                    trading_journal.set_meta("activity_history_through", history_end.isoformat())
-            except Exception as exc:
-                if time.monotonic() - last_error_log > 60:
-                    log(f"[journal] historical account sync failed; retrying later: {exc!r}")
-                    last_error_log = time.monotonic()
-                last_history_attempt = time.monotonic()
-
-            try:
-                orders, trades = client.journal_snapshot()
-                trading_journal.store_broker_records("order", orders)
-                trading_journal.store_broker_records("trade", trades)
-            except Exception as exc:
-                if time.monotonic() - last_error_log > 60:
-                    log(f"[journal] FYERS order/trade sync failed: {exc!r}")
-                    last_error_log = time.monotonic()
-
-            day = now_ist.date().isoformat()
-            if time.monotonic() - last_charge_sync.get(day, 0) >= 300:
+            if time.monotonic() - last_outcome_sync >= 60:
                 try:
-                    charges = client.charges_history(day)
-                    trading_journal.store_charge_report(day, charges)
-                    last_charge_sync[day] = time.monotonic()
+                    _update_recommendation_outcomes(client, now_ist)
                 except Exception as exc:
                     if time.monotonic() - last_error_log > 60:
-                        log(f"[journal] FYERS charge report unavailable yet: {exc!r}")
+                        log(f"[journal] recommendation outcome update failed: {exc!r}")
                         last_error_log = time.monotonic()
-
-            if time.monotonic() - last_outcome_sync >= 60:
-                _update_recommendation_outcomes(client, now_ist)
                 last_outcome_sync = time.monotonic()
         JOURNAL_SYNC_STOP.wait(30)
 
@@ -411,7 +441,7 @@ def _ensure_journal_sync():
         if JOURNAL_SYNC_THREAD is not None and JOURNAL_SYNC_THREAD.is_alive():
             return
         JOURNAL_SYNC_STOP.clear()
-        JOURNAL_SYNC_THREAD = threading.Thread(target=_journal_sync_loop, name="fyers-journal-sync", daemon=True)
+        JOURNAL_SYNC_THREAD = threading.Thread(target=_journal_sync_loop, name="recommendation-outcome-sync", daemon=True)
         JOURNAL_SYNC_THREAD.start()
 
 
@@ -437,7 +467,8 @@ def _get_atm_preview(kite_client, settings):
     """
     index = settings["index"]
     spot_symbol = engine._resolve_spot_tradingsymbol(index)
-    spot_price = kite_client.get_quote([f"NSE:{spot_symbol}"])[f"NSE:{spot_symbol}"]["last_price"]
+    spot_quote_key = INDEX_SYMBOLS.get(index, f"NSE:{spot_symbol}")
+    spot_price = kite_client.get_quote([spot_quote_key])[spot_quote_key]["last_price"]
 
     with _PREVIEW_LOCK:
         universe = _PREVIEW_UNIVERSE["data"]
@@ -454,9 +485,11 @@ def _get_atm_preview(kite_client, settings):
     ce_instr = universe["instruments_by_strike"][atm_strike]["CE"]
     pe_instr = universe["instruments_by_strike"][atm_strike]["PE"]
 
-    opt_quotes = kite_client.get_quote([f"NFO:{ce_instr['tradingsymbol']}", f"NFO:{pe_instr['tradingsymbol']}"])
-    ce_ltp = opt_quotes[f"NFO:{ce_instr['tradingsymbol']}"]["last_price"]
-    pe_ltp = opt_quotes[f"NFO:{pe_instr['tradingsymbol']}"]["last_price"]
+    ce_key = f"{ce_instr.get('legacy_exchange', 'NFO')}:{ce_instr['tradingsymbol']}"
+    pe_key = f"{pe_instr.get('legacy_exchange', 'NFO')}:{pe_instr['tradingsymbol']}"
+    opt_quotes = kite_client.get_quote([ce_key, pe_key])
+    ce_ltp = opt_quotes[ce_key]["last_price"]
+    pe_ltp = opt_quotes[pe_key]["last_price"]
     lot_size = ce_instr["lot_size"]
     lots = settings.get("lots", 1)
 
@@ -487,10 +520,12 @@ MARKET_OPEN_TIME = datetime.time(9, 15)
 
 def _get_spot_instrument(kite_client, settings):
     index = settings["index"]
-    spot_symbol = engine._resolve_spot_tradingsymbol(index)
+    spot_tradingsymbol = engine._resolve_spot_tradingsymbol(index)
+    spot_symbol = INDEX_SYMBOLS.get(index, f"NSE:{spot_tradingsymbol}")
     with _SPOT_LOCK:
         if _SPOT_INSTRUMENT["symbol"] != spot_symbol:
-            instrument = kite_client.get_index_instrument(spot_symbol, exchange="NSE")
+            instrument = kite_client.get_index_instrument(spot_tradingsymbol, exchange="NSE")
+            spot_symbol = instrument.get("symbol", spot_symbol)
             _SPOT_INSTRUMENT["symbol"] = spot_symbol
             _SPOT_INSTRUMENT["token"] = instrument["instrument_token"]
     return _SPOT_INSTRUMENT["symbol"], _SPOT_INSTRUMENT["token"]
@@ -550,7 +585,7 @@ def update_settings():
     if "index" in incoming:
         requested_index = str(incoming["index"]).strip().upper()
         if requested_index not in SUPPORTED_INDEXES:
-            return jsonify({"ok": False, "error": "Choose a supported index: NIFTY, BANKNIFTY, FINNIFTY, or MIDCPNIFTY."}), 400
+            return jsonify({"ok": False, "error": "Choose a supported index: NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, or SENSEX."}), 400
         with STATE_LOCK:
             if STATE["running"] and requested_index != settings.get("index"):
                 return jsonify({"ok": False, "error": "Stop the engine before changing the options instrument."}), 400
@@ -574,7 +609,7 @@ def update_settings():
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": "lots must be a whole number"}), 400
 
-    for bool_field in ["sl_enabled", "target_enabled", "time_exit_enabled"]:
+    for bool_field in ["sl_enabled", "target_enabled", "profit_lock_enabled", "time_exit_enabled"]:
         if bool_field in incoming:
             settings[bool_field] = bool(incoming[bool_field])
 
@@ -584,6 +619,23 @@ def update_settings():
                 settings[num_field] = float(incoming[num_field])
             except (TypeError, ValueError):
                 return jsonify({"ok": False, "error": f"{num_field} must be a number"}), 400
+
+    for num_field in ["profit_lock_activation", "profit_lock_amount"]:
+        if num_field in incoming:
+            try:
+                number = float(incoming[num_field])
+                if not math.isfinite(number) or number < 0:
+                    return jsonify({"ok": False, "error": f"{num_field} must be a non-negative number"}), 400
+                settings[num_field] = number
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": f"{num_field} must be a number"}), 400
+
+    if settings.get("profit_lock_enabled"):
+        activation = float(settings.get("profit_lock_activation", 2000))
+        floor = float(settings.get("profit_lock_amount", 1000))
+        if (not math.isfinite(activation) or not math.isfinite(floor)
+                or activation < 0 or floor < 0 or activation <= floor):
+            return jsonify({"ok": False, "error": "Profit lock requires non-negative amounts and activation profit greater than the locked profit floor."}), 400
 
     if "profit_margin_factor" in incoming:
         try:
@@ -738,7 +790,7 @@ def spot_ltp():
     settings = load_settings()
     try:
         spot_symbol, _ = _get_spot_instrument(kite_client, settings)
-        ltp = kite_client.get_quote([f"NSE:{spot_symbol}"])[f"NSE:{spot_symbol}"]["last_price"]
+        ltp = kite_client.get_quote([spot_symbol])[spot_symbol]["last_price"]
         return jsonify({"ok": True, "spot_symbol": spot_symbol, "ltp": ltp})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -889,7 +941,18 @@ def _make_event_relays(run_kind="execute"):
     """Shared by /api/execute, /api/manual_trade, and /api/analyze - all
     relay the exact same engine.py event/tick shapes to the browser over
     WebSocket."""
+    run_id = uuid.uuid4().hex
+    signal_id = None
+    try:
+        trading_journal.start_recommendation_run(
+            run_id, run_kind, payload={"configuration": load_settings()})
+    except Exception as exc:
+        _make_log()(f"[journal] could not record run start: {exc!r}")
+
     def on_event(evt):
+        nonlocal signal_id
+        evt = dict(evt)
+        evt["run_id"] = run_id
         universe = None
         if evt.get("type") == "universe_ready":
             with STATE_LOCK:
@@ -900,12 +963,47 @@ def _make_event_relays(run_kind="execute"):
                 STATE["last_decision_event"] = evt
                 universe = STATE.get("last_universe_event")
                 _save_last_analysis_to_disk()
-            try:
-                journal_event = dict(evt)
-                journal_event["run_kind"] = run_kind
-                trading_journal.record_recommendation(journal_event, universe, load_settings())
-            except Exception as exc:  # journal persistence must never interrupt engine safety logic
-                _make_log()(f"[journal] could not save recommendation: {exc!r}")
+            if not evt.get("manual"):
+                signal_id = signal_id or uuid.uuid4().hex
+                evt["signal_id"] = signal_id
+                try:
+                    journal_event = dict(evt)
+                    journal_event["run_kind"] = run_kind
+                    trading_journal.record_recommendation(
+                        journal_event, universe, load_settings(), signal_id=signal_id,
+                        execution_attempt_id=run_id if run_kind == "execute" else None,
+                    )
+                except Exception as exc:  # journal persistence must never interrupt engine safety logic
+                    _make_log()(f"[journal] could not save recommendation: {exc!r}")
+                trading_journal.record_recommendation_run_event(
+                    run_id, "signal_decision", evt, signal_id=signal_id,
+                    status="no_trade" if evt.get("direction") == "NO_TRADE" else "decision_recorded",
+                    result=evt.get("direction"),
+                )
+            else:
+                trading_journal.record_recommendation_run_event(
+                    run_id, "manual_direction_selected", evt,
+                    status="manual_entry_selected", result=evt.get("direction"),
+                )
+        elif evt.get("type") in {"positions_entered", "exit", "leg_exit", "no_trade", "error"}:
+            if signal_id:
+                evt["signal_id"] = signal_id
+            if evt.get("type") == "positions_entered":
+                # The engine retains the broker order IDs and order API response,
+                # but this event alone is not proof of a fill. Keep execution
+                # analytics explicitly separate from signal outcomes.
+                evt["execution_confirmation"] = "order_acknowledgement_only_fill_unconfirmed"
+            status_by_type = {
+                "positions_entered": "order_acknowledged_fill_unconfirmed",
+                "exit": "position_exit_reported",
+                "leg_exit": "position_leg_exit_reported",
+                "no_trade": "no_trade",
+                "error": "failed",
+            }
+            trading_journal.record_recommendation_run_event(
+                run_id, evt["type"], evt, signal_id=signal_id,
+                status=status_by_type[evt["type"]], result=evt.get("reason") or evt.get("direction"),
+            )
         socketio.emit("engine_event", evt)
 
     def on_tick(tick):
@@ -919,21 +1017,6 @@ def _make_event_relays(run_kind="execute"):
     return on_event, on_tick
 
 
-def _sync_journal_once(client, sync_charges=True):
-    orders, trades = client.journal_snapshot()
-    trading_journal.store_broker_records("order", orders)
-    trading_journal.store_broker_records("trade", trades)
-    result = {"orders": len(orders), "trades": len(trades), "charges": False}
-    if sync_charges:
-        day = datetime.datetime.now(trading_journal.IST).date().isoformat()
-        try:
-            trading_journal.store_charge_report(day, client.charges_history(day))
-            result["charges"] = True
-        except Exception as exc:
-            result["charge_message"] = str(exc)
-    return result
-
-
 @app.route("/api/journal", methods=["GET"])
 def journal_data():
     try:
@@ -943,16 +1026,22 @@ def journal_data():
         return jsonify({"ok": False, "error": f"could not read journal: {exc}"}), 500
 
 
-@app.route("/api/journal/sync", methods=["POST"])
-def journal_sync_now():
-    with STATE_LOCK:
-        client = STATE.get("kite_client") if STATE.get("logged_in") else None
-    if client is None:
-        return jsonify({"ok": False, "error": "Log in to FYERS to sync account activity."}), 400
+@app.route("/api/journal/performance", methods=["GET"])
+def journal_performance():
     try:
-        return jsonify({"ok": True, **_sync_journal_once(client)})
+        return jsonify({"ok": True, **trading_journal.historical_performance_report()})
     except Exception as exc:
-        return jsonify({"ok": False, "error": f"FYERS order/trade sync failed: {exc}"}), 502
+        return jsonify({"ok": False, "error": f"could not calculate recommendation performance: {exc}"}), 500
+
+
+@app.route("/api/journal/training-data", methods=["GET"])
+def journal_training_data():
+    try:
+        min_train = request.args.get("min_train", 100, type=int)
+        test_size = request.args.get("test_size", 30, type=int)
+        return jsonify({"ok": True, **trading_journal.fetch_training_records(min_train, test_size)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"could not prepare chronological signal data: {exc}"}), 500
 
 
 def _resume_existing_position_if_any(log):
@@ -981,11 +1070,11 @@ def _resume_existing_position_if_any(log):
             stop_event=stop_event, settings_path=SETTINGS_PATH, log=log,
             kite_client=kite_client, on_event=on_event, on_tick=on_tick,
         ),
-        log,
+        log, on_error=on_event,
     )
 
 
-def _spawn_engine_thread(runnable, log):
+def _spawn_engine_thread(runnable, log, on_error=None):
     """Shared STATE/thread/socketio boilerplate for both the automated
     Execute run and the manual direction override - the only difference
     between them is which engine function `runnable` actually calls."""
@@ -994,6 +1083,8 @@ def _spawn_engine_thread(runnable, log):
             runnable()
         except Exception as exc:  # noqa: BLE001 - surface to UI, never crash the server process
             log(f"[app] engine run failed: {exc!r}")
+            if on_error is not None:
+                on_error({"type": "error", "message": str(exc)})
             socketio.emit("engine_event", {"type": "error", "message": str(exc)})
         finally:
             with STATE_LOCK:
@@ -1025,7 +1116,7 @@ def execute():
             stop_event=stop_event, settings_path=SETTINGS_PATH, log=log,
             kite_client=kite_client, on_event=on_event, on_tick=on_tick,
         ),
-        log,
+        log, on_error=on_event,
     )
     return jsonify({"ok": True})
 
@@ -1062,7 +1153,7 @@ def manual_trade():
             direction, stop_event=stop_event, settings_path=SETTINGS_PATH, log=log,
             kite_client=kite_client, on_event=on_event, on_tick=on_tick,
         ),
-        log,
+        log, on_error=on_event,
     )
     return jsonify({"ok": True, "direction": direction})
 
@@ -1091,7 +1182,7 @@ def analyze():
         lambda: engine.analyze_only(
             settings_path=SETTINGS_PATH, log=log, kite_client=kite_client, on_event=on_event, on_tick=on_tick,
         ),
-        log,
+        log, on_error=on_event,
     )
     return jsonify({"ok": True})
 

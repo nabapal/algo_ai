@@ -18,8 +18,11 @@ REDIRECT_HOST, REDIRECT_PORT = "127.0.0.1", 5000
 REDIRECT_URL = f"http://{REDIRECT_HOST}:{REDIRECT_PORT}/"
 LOGIN_TIMEOUT_SECONDS = 240
 INDEX_SYMBOLS = {"NIFTY": "NSE:NIFTY50-INDEX", "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
-                 "FINNIFTY": "NSE:FINNIFTY-INDEX", "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX"}
-MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO_sym_master.json"
+                 "FINNIFTY": "NSE:FINNIFTY-INDEX", "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
+                 "SENSEX": "BSE:SENSEX-INDEX"}
+INDEX_EXCHANGES = {name: symbol.split(":", 1)[0] for name, symbol in INDEX_SYMBOLS.items()}
+MASTER_URLS = {"NSE": "https://public.fyers.in/sym_details/NSE_FO_sym_master.json",
+               "BSE": "https://public.fyers.in/sym_details/BSE_FO_sym_master.json"}
 # This dashboard only builds option universes for these index families. Keep
 # the cached derivative master limited to them instead of retaining every
 # stock and contract in NSE F&O for the lifetime of the process.
@@ -100,7 +103,7 @@ class FyersClient:
         self._option_snapshot = {}
         self._ticker_connected = threading.Event()
         self._last_tick_time = None
-        self._master = None
+        self._master = {}
 
     def _session(self, state="algo_ai"):
         return fyersModel.SessionModel(client_id=self.client_id, secret_key=self.secret,
@@ -157,15 +160,18 @@ class FyersClient:
         self.fyers = fyersModel.FyersModel(client_id=self.client_id, token=token,
             is_async=False, log_path="")
 
-    def _get_master(self):
-        if self._master is None:
-            response = requests.get(MASTER_URL, timeout=30)
+    def _get_master(self, exchange="NSE"):
+        exchange = "BSE" if str(exchange).upper() in ("BSE", "BFO") else "NSE"
+        if exchange not in self._master:
+            response = requests.get(MASTER_URLS[exchange], timeout=30)
             response.raise_for_status()
-            self._master = []
             try:
                 records = response.json()
             except ValueError as exc:
-                raise RuntimeError("FYERS returned an invalid NSE_FO symbol-master response") from exc
+                raise RuntimeError(f"FYERS returned an invalid {exchange}_FO symbol-master response") from exc
+            master = []
+            aliases = MASTER_UNDERLYING_ALIASES if exchange == "NSE" else {"SENSEX"}
+            prefixes = MASTER_SYMBOL_PREFIXES if exchange == "NSE" else ("SENSEX",)
             # The current JSON master is keyed by API symbol and supplies
             # explicit fyToken, minLotSize, expiryDate, strikePrice and optType.
             for api_symbol, record in records.items():
@@ -177,8 +183,10 @@ class FyersClient:
                     underlying = "".join(ch for ch in str(record.get("underSym") or "").upper()
                                          if ch.isalnum())
                     normalized_symbol = "".join(ch for ch in tradingsymbol.upper() if ch.isalnum())
-                    if (underlying not in MASTER_UNDERLYING_ALIASES
-                            and not normalized_symbol.startswith(MASTER_SYMBOL_PREFIXES)):
+                    if not symbol.startswith(exchange + ":"):
+                        continue
+                    if (underlying not in aliases
+                            and not normalized_symbol.startswith(prefixes)):
                         continue
                     expiry_raw = record.get("expiryDate")
                     if not expiry_raw:
@@ -192,15 +200,17 @@ class FyersClient:
                     exchange_type = int(record.get("exInstType") or 0)
                     kind = opt_type if opt_type in ("CE", "PE") else (
                         "FUT" if exchange_type in (11, 12, 13, 16, 17, 18, 25, 30) else "XX")
-                    self._master.append({"instrument_token": str(record.get("fyToken") or ""),
+                    master.append({"instrument_token": str(record.get("fyToken") or ""),
                         "tradingsymbol": tradingsymbol, "symbol": symbol,
                         "lot_size": int(float(record.get("minLotSize") or 1)), "expiry": expiry,
                         "strike": float(record.get("strikePrice") or 0), "instrument_type": kind,
                         "name": str(record.get("underSym") or record.get("exSymName") or ""),
+                        "api_exchange": exchange, "legacy_exchange": "BFO" if exchange == "BSE" else "NFO",
                         "segment": str(record.get("segment") or "")})
                 except (ValueError, TypeError, OverflowError):
                     continue
-        return self._master
+            self._master[exchange] = master
+        return self._master[exchange]
 
     def get_index_instrument(self, tradingsymbol, exchange="NSE"):
         index = next((k for k, v in INDEX_SYMBOLS.items() if v.split(":", 1)[-1] == tradingsymbol), None)
@@ -209,7 +219,7 @@ class FyersClient:
         if index is None:
             # Map the legacy engine labels.
             index = {"NIFTY 50": "NIFTY", "NIFTY BANK": "BANKNIFTY", "NIFTY FIN SERVICE": "FINNIFTY",
-                     "NIFTY MID SELECT": "MIDCPNIFTY"}.get(tradingsymbol)
+                     "NIFTY MID SELECT": "MIDCPNIFTY", "SENSEX": "SENSEX", "SENSEX-INDEX": "SENSEX"}.get(tradingsymbol)
         symbol = INDEX_SYMBOLS.get(index, f"{exchange}:{tradingsymbol}")
         result = self.fyers.quotes({"symbols": symbol})
         values = result.get("d", [])
@@ -219,7 +229,9 @@ class FyersClient:
         self._symbol_by_token[token] = symbol
         self._token_by_symbol[symbol] = token
         return {"instrument_token": token, "tradingsymbol": symbol.split(":", 1)[-1], "symbol": symbol,
-                "lot_size": 1, "strike": 0, "instrument_type": "INDEX", "name": index}
+                "lot_size": 1, "strike": 0, "instrument_type": "INDEX", "name": index,
+                "api_exchange": symbol.split(":", 1)[0],
+                "legacy_exchange": "BSE" if symbol.startswith("BSE:") else "NSE"}
 
     def get_nfo_option_chain(self, name, today=None):
         name = name if name in INDEX_SYMBOLS else "NIFTY"
@@ -230,7 +242,8 @@ class FyersClient:
         if resp.get("s") != "ok" or not expiry_data:
             raise RuntimeError(f"FYERS option chain request failed: {resp}")
         expiry = dt.datetime.strptime(expiry_data[0]["date"], "%d-%m-%Y").date()
-        master = self._get_master()
+        exchange = INDEX_EXCHANGES[name]
+        master = self._get_master(exchange)
         by_symbol = {i["symbol"].strip().upper(): i for i in master}
         by_token = {str(i["instrument_token"]): i for i in master}
         chain = []
@@ -248,7 +261,9 @@ class FyersClient:
             item = dict(item)
             item.update({"instrument_token": token or str(item["instrument_token"]),
                          "strike": float(leg["strike_price"]), "instrument_type": typ,
-                         "expiry": expiry, "name": name})
+                         "expiry": expiry, "name": name,
+                         "api_exchange": exchange,
+                         "legacy_exchange": "BFO" if exchange == "BSE" else "NFO"})
             # Keep the FYERS API symbol from the chain: it is the symbol used
             # for both websocket subscription and order placement.
             item["symbol"] = symbol
@@ -272,10 +287,12 @@ class FyersClient:
             "BANKNIFTY": {"BANKNIFTY", "NIFTYBANK"},
             "FINNIFTY": {"FINNIFTY", "NIFTYFINSERVICE", "NIFTYFINANCIALSERVICES"},
             "MIDCPNIFTY": {"MIDCPNIFTY", "NIFTYMIDSELECT"},
+            "SENSEX": {"SENSEX"},
         }
         normalize = lambda value: "".join(ch for ch in str(value).upper() if ch.isalnum())
         accepted_names = aliases.get(name, {normalize(name)})
-        candidates = [i for i in self._get_master()
+        exchange = INDEX_EXCHANGES.get(name, "NSE")
+        candidates = [i for i in self._get_master(exchange)
                       if i["instrument_type"] == "FUT" and i["expiry"] >= today
                       and (normalize(i["name"]) in accepted_names
                            or normalize(i["tradingsymbol"]).startswith(normalize(name)))]
@@ -303,7 +320,9 @@ class FyersClient:
             oi_source = "quote" if quote_oi not in (None, 0) else (
                 "option_chain_snapshot" if chain_snapshot.get("oi") is not None else "missing")
             out[key] = {"last_price": v.get("lp", 0), "oi": quote_oi, "volume": v.get("volume", 0),
-                        "average_price": v.get("atp", 0), "ohlc": {"open": v.get("open_price"), "close": v.get("prev_close_price")}}
+                        "average_price": v.get("atp", 0), "source_timestamp": v.get("tt"),
+                        "received_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "ohlc": {"open": v.get("open_price"), "close": v.get("prev_close_price")}}
             # FYERS quotes omit OI; the option-chain snapshot carries OI and volume.
             if out[key].get("oi") in (None, 0) and chain_snapshot.get("oi") is not None:
                 out[key]["oi"] = chain_snapshot["oi"]
@@ -317,28 +336,53 @@ class FyersClient:
     def _format_symbol(self, symbol):
         if symbol in self._symbol_by_token.values():
             return symbol
-        exch, _, ts = symbol.partition(":")
-        if ts.endswith("-INDEX") or ts.endswith("-EQ") or ts.endswith("-FUT") or ts[-2:] in ("CE", "PE"):
+        exch, separator, ts = symbol.partition(":")
+        if not separator:
+            ts = exch
+            exch = ""
+        index_match = next((api_symbol for api_symbol in INDEX_SYMBOLS.values()
+                            if api_symbol.split(":", 1)[-1] == ts), None)
+        if index_match:
+            return index_match
+        if exch.upper() in ("NFO", "BFO"):
+            api_exchange = "NSE" if exch.upper() == "NFO" else "BSE"
+            matches = [i for i in self._get_master(api_exchange) if i["tradingsymbol"] == ts]
+            if matches:
+                return matches[0]["symbol"]
+            other_exchange = "BSE" if api_exchange == "NSE" else "NSE"
+            matches = [i for i in self._get_master(other_exchange) if i["tradingsymbol"] == ts]
+            if matches:
+                return matches[0]["symbol"]
+            return f"{api_exchange}:{ts}"
+        if exch.upper() in ("NSE", "BSE") and (ts.endswith("-INDEX") or ts.endswith("-EQ")
+                                                  or ts.endswith("-FUT") or ts[-2:] in ("CE", "PE")):
             # Engine uses Kite-style NFO keys; FYERS exposes NSE F&O symbols
-            # with the NSE exchange prefix (e.g. NSE:NIFTY26O0622400CE).
-            return f"{'NSE' if exch.upper() == 'NFO' else exch}:{ts}"
-        # Resolve engine-facing symbols against FYERS's downloaded master.
-        match = next((i["symbol"] for i in self._get_master() if i["tradingsymbol"] == ts), None)
+            # as NSE:... and BSE F&O symbols as BSE:... .
+            return f"{exch.upper()}:{ts}"
+        # Resolve exchange-less symbols against the derivatives masters.
+        match = next((i["symbol"] for exchange in ("NSE", "BSE")
+                      for i in self._get_master(exchange) if i["tradingsymbol"] == ts), None)
         if match:
             return match
         idx = {"NIFTY 50": "NSE:NIFTY50-INDEX", "NIFTY BANK": "NSE:NIFTYBANK-INDEX",
                "NIFTY FIN SERVICE": "NSE:FINNIFTY-INDEX", "NIFTY MID SELECT": "NSE:MIDCPNIFTY-INDEX",
-               "INDIA VIX": "NSE:INDIAVIX-INDEX"}.get(ts)
+               "INDIA VIX": "NSE:INDIAVIX-INDEX", "SENSEX": "BSE:SENSEX-INDEX",
+               "SENSEX-INDEX": "BSE:SENSEX-INDEX"}.get(ts)
         return idx or f"{exch}:{ts}"
 
     def _legacy_key(self, symbol):
         prefix, _, ts = symbol.partition(":")
-        return f"{'NFO' if prefix == 'NSE' and (ts.endswith('CE') or ts.endswith('PE') or 'FUT' in ts) else 'NSE'}:{ts}"
+        is_derivative = ts.endswith(("CE", "PE", "FUT"))
+        if prefix == "BSE":
+            return f"{'BFO' if is_derivative else 'BSE'}:{ts}"
+        return f"{'NFO' if is_derivative else 'NSE'}:{ts}"
 
     def _history(self, token, start, end, resolution, oi=False):
         symbol = self._symbol_by_token.get(str(token), str(token))
-        if not symbol.startswith("NSE:"):
+        if ":" not in symbol:
             symbol = self._format_symbol(f"NFO:{symbol}")
+        else:
+            symbol = self._format_symbol(symbol)
         data = {"symbol": symbol, "resolution": resolution, "date_format": "1",
                 "range_from": start.strftime("%Y-%m-%d"), "range_to": end.strftime("%Y-%m-%d"), "cont_flag": "1"}
         if oi:
@@ -360,7 +404,7 @@ class FyersClient:
 
     def get_intraday_history_for_symbol(self, symbol, start, end, interval="1minute"):
         resolution = "1" if interval in ("minute", "1minute") else "5" if "5" in interval else "15"
-        api_symbol = symbol if str(symbol).startswith("NSE:") else self._format_symbol(f"NSE:{symbol}")
+        api_symbol = self._format_symbol(symbol) if ":" in str(symbol) else self._format_symbol(f"NFO:{symbol}")
         response = self.fyers.history(data={
             "symbol": api_symbol, "resolution": resolution, "date_format": "1",
             "range_from": start.strftime("%Y-%m-%d"), "range_to": end.strftime("%Y-%m-%d"),
@@ -476,92 +520,34 @@ class FyersClient:
         out = []
         for p in response.get("netPositions", []):
             sym = p.get("symbol", "")
-            out.append({"tradingsymbol": sym.split(":")[-1], "exchange": "NFO" if sym.endswith(("CE", "PE")) else "NSE",
+            api_exchange = sym.split(":", 1)[0]
+            is_option = sym.endswith(("CE", "PE"))
+            legacy_exchange = ("BFO" if api_exchange == "BSE" else "NFO") if is_option else api_exchange
+            out.append({"tradingsymbol": sym.split(":")[-1], "exchange": legacy_exchange,
                         "product": "MIS" if p.get("productType") == "INTRADAY" else p.get("productType"),
                         "quantity": p.get("netQty", 0), "average_price": p.get("netAvg", p.get("buyAvg", 0)),
                         "last_price": p.get("ltp"), "pnl": p.get("pl", 0), "symbol": sym})
         return {"net": out}
 
-    def journal_snapshot(self):
-        """Fetch the account-wide order and trade books for reconciliation."""
-        orders = self.fyers.orderbook()
-        trades = self.fyers.tradebook()
-        for label, response in (("orderbook", orders), ("tradebook", trades)):
-            if not isinstance(response, dict) or response.get("s") != "ok":
-                raise RuntimeError(f"FYERS {label} failed: {response}")
-        order_rows = self._journal_rows(orders, ("orderBook", "orderbook", "orders"))
-        trade_rows = self._journal_rows(trades, ("tradeBook", "tradebook", "trades"))
-        return order_rows, trade_rows
-
-    def charges_history(self, from_date, to_date=None):
-        """Fetch FYERS's reported charges for the account and date range."""
-        to_date = to_date or from_date
-        response = requests.get(
-            "https://api-t1.fyers.in/api/v3/charges-history",
-            headers={"Authorization": f"{self.client_id}:{self.access_token}"},
-            params={"from_date": from_date, "to_date": to_date, "page_size": 100, "page_no": 1},
-            timeout=15,
-        )
-        response.raise_for_status()
-        result = response.json()
-        if not isinstance(result, dict) or result.get("s") != "ok":
-            raise RuntimeError(f"FYERS charges history failed: {result}")
-        return result
-
-    @staticmethod
-    def _journal_rows(response, row_keys):
-        """Find a report's row list across FYERS response envelope variants."""
-        wanted = {key.lower() for key in row_keys}
-        def visit(value):
-            if isinstance(value, dict):
-                for key, child in value.items():
-                    if key.lower() in wanted and isinstance(child, list):
-                        return child
-                for child in value.values():
-                    found = visit(child)
-                    if found is not None:
-                        return found
-            return None
-        return visit(response) or []
-
-    def journal_history(self, from_date, to_date):
-        """Backfill account order/trade history for dates missed while offline."""
-        headers = {"Authorization": f"{self.client_id}:{self.access_token}"}
-        results = {}
-        for name, keys in (("order-history", ("orderHistory", "orderBook", "orders")),
-                           ("trade-history", ("tradeHistory", "tradeBook", "trades"))):
-            rows = []
-            page = 1
-            while page <= 50:
-                response = requests.get(
-                    f"https://api-t1.fyers.in/api/v3/{name}", headers=headers,
-                    params={"from_date": from_date, "to_date": to_date,
-                            "page_size": 100, "page_no": page}, timeout=20,
-                )
-                response.raise_for_status()
-                payload = response.json()
-                if not isinstance(payload, dict) or payload.get("s") != "ok":
-                    raise RuntimeError(f"FYERS {name} failed: {payload}")
-                batch = self._journal_rows(payload, keys)
-                rows.extend(batch)
-                if len(batch) < 100:
-                    break
-                page += 1
-            results["orders" if name == "order-history" else "trades"] = rows
-        results["charges"] = self.charges_history(from_date, to_date)
-        return results
-
-    def is_nse_fo_market_open(self):
-        """Fail closed unless FYERS reports NSE derivatives as currently OPEN."""
+    def is_fo_market_open(self, exchange="NSE"):
+        """Fail closed unless FYERS reports the selected exchange's F&O segment OPEN."""
         response = self.fyers.market_status()
         if response.get("code") != 200:
             raise RuntimeError(f"FYERS market-status check failed: {response}")
         rows = response.get("marketStatus", [])
-        nse_fo = [row for row in rows
-                  if int(row.get("exchange", -1)) == 10 and int(row.get("segment", -1)) == 11]
-        if not nse_fo:
-            raise RuntimeError(f"FYERS market-status response has no NSE F&O segment: {response}")
-        return any(str(row.get("status", "")).upper() == "OPEN" for row in nse_fo)
+        exchange_code = 12 if str(exchange).upper() in ("BSE", "BFO") else 10
+        segment_code = 12 if exchange_code == 12 else 11
+        fo_rows = [row for row in rows
+                   if int(row.get("exchange", -1)) == exchange_code
+                   and int(row.get("segment", -1)) == segment_code]
+        exchange_name = "BSE" if exchange_code == 12 else "NSE"
+        if not fo_rows:
+            raise RuntimeError(f"FYERS market-status response has no {exchange_name} F&O segment: {response}")
+        return any(str(row.get("status", "")).upper() == "OPEN" for row in fo_rows)
+
+    def is_nse_fo_market_open(self):
+        """Backward-compatible NSE F&O market-status check."""
+        return self.is_fo_market_open("NSE")
 
     def get_actual_position_qty(self, tradingsymbol, exchange="NFO", product="MIS", expected_qty=None):
         if self.settings.get("dry_run", True):
